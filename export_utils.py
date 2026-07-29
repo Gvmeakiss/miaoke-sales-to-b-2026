@@ -56,11 +56,17 @@ def _group_summary(df, group_columns, amount_col, invoice_total_amount):
     return summary
 
 
-def build_overall_summary(df, amount_col, invoice_total_amount):
-    """按场景大类生成总体汇总并追加总计。"""
+def build_overall_summary(df, amount_col, invoice_total_amount, aqpp_total_amount=None):
+    """按场景大类生成总体汇总，并将渠道勾稽占比与AQPP口径分开。"""
     category_col = 'AQPP分类' if 'AQPP分类' in df.columns else '场景分类'
     summary = _group_summary(df, [category_col], amount_col, invoice_total_amount)
     summary = summary.rename(columns={category_col: '场景分类'})
+    summary['AQPP范围金额占比'] = summary.apply(
+        lambda row: calculate_invoice_amount_share(row['发票金额'], aqpp_total_amount)
+        if row['场景分类'] != 'Not Test' and aqpp_total_amount is not None
+        else '',
+        axis=1,
+    )
     total = pd.DataFrame([{
         '场景分类': '总计',
         '记录数': len(df),
@@ -70,6 +76,7 @@ def build_overall_summary(df, amount_col, invoice_total_amount):
             pd.to_numeric(df[amount_col], errors='coerce').fillna(0).sum() if amount_col in df.columns else 0,
             invoice_total_amount,
         ),
+        'AQPP范围金额占比': '',
     }])
     return pd.concat([summary, total], ignore_index=True)
 
@@ -173,6 +180,7 @@ def build_invoice_scope_bridge(
     amount_label,
     aqpp_input_invoices=None,
     invalid_key_invoices=None,
+    separate_exclusions=False,
 ):
     """桥接PBC至正式聚合输入，并将政策剔除与关键键缺失分开披露。"""
     columns = ['桥接项目', '清单行数', 'SAP发票数', '发票不含税金额', '发票金额']
@@ -228,6 +236,28 @@ def build_invoice_scope_bridge(
     policy_row = bridge_row('2. 政策允许（冲销处理后）', policy_allowed)
     aqpp_row = bridge_row('3. 匹配键完整的正式聚合输入', formal_input)
     invalid_row = bridge_row('4. 政策允许但匹配键缺失', invalid_keys)
+    if separate_exclusions and '冲销处理编码' in excluded.columns:
+        cancellation_mask = excluded['冲销处理编码'].notna()
+        policy_row_excluded = bridge_row(
+            '5. 政策排除（未执行普通AQPP）',
+            excluded.loc[~cancellation_mask],
+        )
+        cancellation_row = bridge_row(
+            '6. 冲销前置处理',
+            excluded.loc[cancellation_mask],
+        )
+        check = {
+            '桥接项目': '7. 校验差额（1-3-4-5-6）',
+            '清单行数': raw_row['清单行数'] - aqpp_row['清单行数'] - invalid_row['清单行数'] - policy_row_excluded['清单行数'] - cancellation_row['清单行数'],
+            'SAP发票数': '',
+            '发票不含税金额': round(raw_row['发票不含税金额'] - aqpp_row['发票不含税金额'] - invalid_row['发票不含税金额'] - policy_row_excluded['发票不含税金额'] - cancellation_row['发票不含税金额'], 2),
+            '发票金额': round(raw_row['发票金额'] - aqpp_row['发票金额'] - invalid_row['发票金额'] - policy_row_excluded['发票金额'] - cancellation_row['发票金额'], 2),
+        }
+        return pd.DataFrame(
+            [raw_row, policy_row, aqpp_row, invalid_row, policy_row_excluded, cancellation_row, check],
+            columns=columns,
+        )
+
     excluded_row = bridge_row('5. 政策或冲销前置排除', excluded)
     check = {
         '桥接项目': '6. 校验差额（1-3-4-5）',
@@ -488,19 +518,24 @@ def _prepare_detail_frame(frame, drop_cols=None):
 def _invoice_stats_values(invoice_stats):
     """兼容旧tuple，并统一返回清单行数、发票数、匹配键数及金额。"""
     if invoice_stats is None:
-        return {'清单行数': 0, 'SAP发票数': 0, '匹配键数': 0, '发票金额': 0.0}
+        return {'清单行数': 0, 'SAP发票数': 0, '匹配键数': 0, '发票金额': 0.0, 'AQPP范围发票金额': None}
     if isinstance(invoice_stats, dict):
         return {
             '清单行数': int(invoice_stats.get('清单行数', 0)),
             'SAP发票数': int(invoice_stats.get('SAP发票数', 0)),
             '匹配键数': int(invoice_stats.get('匹配键数', 0)),
             '发票金额': float(invoice_stats.get('发票金额', 0.0)),
+            'AQPP范围发票金额': (
+                float(invoice_stats['AQPP范围发票金额'])
+                if invoice_stats.get('AQPP范围发票金额') is not None else None
+            ),
         }
     return {
         '清单行数': int(invoice_stats[0]),
         'SAP发票数': 0,
         '匹配键数': 0,
         '发票金额': float(invoice_stats[1]),
+        'AQPP范围发票金额': None,
     }
 
 
@@ -571,6 +606,7 @@ def export_with_classification(df_data, output_file, file_label='',
                                invoice_matchability_summary=None,
                                cancellation_details=None,
                                cancellation_summary=None,
+                               separate_bridge_exclusions=False,
                                summary_file=None,
                                detail_file=None,
                                unmatched_file=None):
@@ -603,7 +639,12 @@ def export_with_classification(df_data, output_file, file_label='',
         float(pd.to_numeric(df_data[amount_col], errors='coerce').sum()) if amount_col and amount_col in df_data.columns else 0.0
     )
     df_summary_scope = add_company_code(build_summary_scope(df_data, extra_categories, amount_col))
-    df_overall_summary = build_overall_summary(df_summary_scope, amount_col, invoice_total_amount)
+    df_overall_summary = build_overall_summary(
+        df_summary_scope,
+        amount_col,
+        invoice_total_amount,
+        aqpp_total_amount=stats_values.get('AQPP范围发票金额'),
+    )
     df_company_summary = build_company_summary(df_summary_scope, amount_col, invoice_total_amount)
     df_company_scenario = build_company_scenario_summary(df_summary_scope, amount_col, invoice_total_amount)
     df_invoice_inventory_summary = build_invoice_inventory_summary(
@@ -614,6 +655,7 @@ def export_with_classification(df_data, output_file, file_label='',
         amount_label,
         aqpp_input_invoices=aqpp_input_invoices,
         invalid_key_invoices=invalid_key_invoices,
+        separate_exclusions=separate_bridge_exclusions,
     )
     df_aqpp_scenario_report = build_aqpp_scenario_report(
         df_summary_scope,

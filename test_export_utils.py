@@ -6,6 +6,7 @@ import unittest
 import pandas as pd
 
 from export_utils import (
+    build_overall_summary,
     build_invoice_inventory_summary,
     build_invoice_scope_bridge,
     build_summary_scope,
@@ -13,6 +14,21 @@ from export_utils import (
 
 
 class ExportUtilsTests(unittest.TestCase):
+    def test_overall_summary_separates_channel_share_from_aqpp_scope_share(self):
+        source = pd.DataFrame({
+            'AQPP分类': ['完全匹配', 'Not Test'],
+            '开票金额': [90.0, 50.0],
+        })
+        summary = build_overall_summary(
+            source,
+            '开票金额',
+            invoice_total_amount=140.0,
+            aqpp_total_amount=100.0,
+        ).set_index('场景分类')
+        self.assertEqual(summary.loc['完全匹配', '发票金额占比'], '64.3%')
+        self.assertEqual(summary.loc['完全匹配', 'AQPP范围金额占比'], '90.0%')
+        self.assertEqual(summary.loc['Not Test', 'AQPP范围金额占比'], '')
+
     def _inventory(self):
         return pd.DataFrame({
             'SAP发票号': ['I1', 'I2', 'I3'],
@@ -41,6 +57,20 @@ class ExportUtilsTests(unittest.TestCase):
         self.assertEqual(bridge.loc['5. 政策或冲销前置排除', '清单行数'], 2)
         self.assertEqual(bridge.loc['6. 校验差额（1-3-4-5）', '清单行数'], 0)
         self.assertEqual(bridge.loc['6. 校验差额（1-3-4-5）', '发票金额'], 0.0)
+
+    def test_bridge_can_separate_policy_and_cancellation_exclusions(self):
+        inventory = self._inventory()
+        inventory['冲销处理编码'] = [pd.NA, 'CA-01', pd.NA]
+        bridge = build_invoice_scope_bridge(
+            inventory,
+            'SAP开票含税金额',
+            inventory.iloc[[0]],
+            inventory.iloc[0:0],
+            separate_exclusions=True,
+        ).set_index('桥接项目')
+        self.assertEqual(bridge.loc['5. 政策排除（未执行普通AQPP）', '清单行数'], 1)
+        self.assertEqual(bridge.loc['6. 冲销前置处理', '清单行数'], 1)
+        self.assertEqual(bridge.loc['7. 校验差额（1-3-4-5-6）', '发票金额'], 0.0)
 
     def test_summary_scope_adds_full_standard_nt(self):
         base = pd.DataFrame({

@@ -156,6 +156,15 @@ def _not_test_code(has_order, has_delivery, has_invoice) -> pd.Series:
     return result
 
 
+def classify_not_test_presence(has_order, has_delivery, has_invoice) -> pd.Series:
+    """按三单实际存在关系返回现有 NT-00、NT-28 至 NT-33 编码。"""
+    return _not_test_code(
+        pd.Series(has_order).fillna(False).astype(bool),
+        pd.Series(has_delivery).fillna(False).astype(bool),
+        pd.Series(has_invoice).fillna(False).astype(bool),
+    )
+
+
 def assign_aqpp_scenarios(df: pd.DataFrame, amount_tolerance: float, quantity_tolerance: float) -> pd.DataFrame:
     """按AQPP 24组及Not Test规则分类；返回副本，不修改原DataFrame。"""
     out = df.copy()

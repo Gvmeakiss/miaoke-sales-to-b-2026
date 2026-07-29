@@ -32,7 +32,12 @@
 import pandas as pd
 import numpy as np
 
-from aqpp_scenarios import assign_aqpp_scenarios, map_aqpp_to_legacy
+from aqpp_scenarios import (
+    NOT_TEST_DESCRIPTIONS,
+    assign_aqpp_scenarios,
+    classify_not_test_presence,
+    map_aqpp_to_legacy,
+)
 from config import AMOUNT_TAIL_TOLERANCE, AMOUNT_TOLERANCE, QUANTITY_TOLERANCE
 from reconciliation_measures import build_three_way_measures
 from tolerance_utils import absolute_greater_than, absolute_less_than, equal_with_tolerance, greater_with_tolerance
@@ -290,4 +295,35 @@ def assign_parallel_scenarios(df: pd.DataFrame, channel: str) -> pd.DataFrame:
     out['场景标号'] = legacy['场景标号']
     out['大类'] = legacy['大类']
     out['细分场景'] = legacy['细分场景']
+    return out
+
+
+def assign_existing_not_test_scenarios(df: pd.DataFrame, channel: str) -> pd.DataFrame:
+    """将不执行普通AQPP的发票按实际三单存在关系归入现有Not Test编码。
+
+    这些发票参与渠道金额完整性核对，但无论订单、发运是否齐全，都不进入
+    AQPP-01至AQPP-24。三单均存在时归入NT-00；其余组合使用NT-28至NT-33。
+    """
+    out = build_three_way_measures(df, channel)
+    codes = classify_not_test_presence(
+        out['存在销售订单'], out['存在发运单'], out['存在销售发票']
+    )
+    out['AQPP场景编码'] = codes
+    out['AQPP场景描述'] = codes.map(NOT_TEST_DESCRIPTIONS)
+    out['AQPP分类'] = 'Not Test'
+    out['AQPP可分类'] = False
+    out['AQPP金额场景编码'] = pd.NA
+    out['AQPP金额场景'] = '待确认'
+    out['AQPP数量场景编码'] = pd.NA
+    out['AQPP数量场景'] = '待确认'
+    out = map_aqpp_to_legacy(out)
+    out['去年原始判断编码'] = '待确认'
+    out['去年原始判断描述'] = '待确认'
+    out['去年原始大类'] = '5.有缺失'
+    out['去年原始细分场景'] = '5.Not test'
+    out['去年映射与原始判断一致'] = False
+    out['场景标号'] = pd.to_numeric(out['去年场景编码'], errors='coerce').fillna(0).astype(int)
+    out['大类'] = '5.有缺失'
+    out['细分场景'] = '5.Not test'
+    out['2.Not test'] = True
     return out
