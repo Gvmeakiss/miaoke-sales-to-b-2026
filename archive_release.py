@@ -172,7 +172,7 @@ AQPP规范、管理层口径说明和Audit回复。
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='生成版本化轻量归档和校验清单')
-    parser.add_argument('--version', default='2026H1_20260729_v2', help='归档版本目录及ZIP名称')
+    parser.add_argument('--version', default='2026H1_20260730_v3', help='归档版本目录及ZIP名称')
     parser.add_argument('--replace', action='store_true', help='仅在明确需要时覆盖同名归档')
     return parser.parse_args()
 

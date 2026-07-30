@@ -6,6 +6,8 @@ import unittest
 import pandas as pd
 
 from export_utils import (
+    add_company_code,
+    build_full_not_test_detail,
     build_overall_summary,
     build_invoice_inventory_summary,
     build_invoice_scope_bridge,
@@ -14,6 +16,31 @@ from export_utils import (
 
 
 class ExportUtilsTests(unittest.TestCase):
+    def test_company_code_coalesces_sources_row_by_row(self):
+        source = pd.DataFrame({
+            '公司代码': ['1100', pd.NA, '公司代码缺失'],
+            '销售组织': [pd.NA, 1160, 1190],
+        })
+        result = add_company_code(source)
+        self.assertEqual(result['公司代码'].tolist(), ['1100', '1160', '1190'])
+
+    def test_full_not_test_detail_matches_summary_components(self):
+        base = pd.DataFrame({
+            'AQPP分类': ['完全匹配', 'Not Test'],
+            'AQPP可分类': [True, False],
+            '开票金额': [100.0, 20.0],
+        })
+        extras = {
+            '仅订单': pd.DataFrame({'订单号': ['O1']}),
+            '仅发货单': pd.DataFrame({'发运号': ['D1']}),
+            '仅订单及发货单': pd.DataFrame({'订单号': ['O2']}),
+            '仅发票': pd.DataFrame({'开票金额': [-5.0]}),
+        }
+        result = build_full_not_test_detail(base, extras)
+        self.assertEqual(len(result), 5)
+        self.assertEqual(set(result['AQPP场景编码'].dropna()), {'NT-28', 'NT-29', 'NT-30', 'NT-31'})
+        self.assertAlmostEqual(pd.to_numeric(result['开票金额'], errors='coerce').sum(), 15.0)
+
     def test_overall_summary_separates_channel_share_from_aqpp_scope_share(self):
         source = pd.DataFrame({
             'AQPP分类': ['完全匹配', 'Not Test'],

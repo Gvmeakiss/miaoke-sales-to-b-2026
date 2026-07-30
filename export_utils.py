@@ -29,14 +29,23 @@ SUMMARY_EXTRA_NT = {
 
 
 def add_company_code(df):
-    """建立展示用公司代码；缺失值单列为“公司代码缺失”，不丢弃记录。"""
+    """逐行建立展示用公司代码，而不是为整张表只选一个来源列。"""
     out = df.copy()
-    source = next((column for column in ('公司代码', '发票-公司代码', '发票-销售组织', '销售组织') if column in out.columns), None)
-    if source:
-        company = out[source].astype('string').str.strip().str.replace(r'\.0$', '', regex=True)
-        out['公司代码'] = company.fillna('公司代码缺失').replace('', '公司代码缺失')
-    else:
-        out['公司代码'] = '公司代码缺失'
+    company = pd.Series(pd.NA, index=out.index, dtype='string')
+    for column in ('公司代码', '发票-公司代码', '发票-销售组织', '销售组织'):
+        if column not in out.columns:
+            continue
+        candidate = (
+            out[column].astype('string').str.strip().str.replace(r'\.0$', '', regex=True)
+        ).replace({
+            '': pd.NA,
+            '公司代码缺失': pd.NA,
+            'N/A': pd.NA,
+            'nan': pd.NA,
+            '<NA>': pd.NA,
+        })
+        company = company.fillna(candidate)
+    out['公司代码'] = company.fillna('公司代码缺失')
     return out
 
 
@@ -593,6 +602,48 @@ def build_summary_scope(df_data, extra_categories, amount_col):
     return pd.concat(parts, ignore_index=True, sort=False)
 
 
+def build_full_not_test_detail(df_data, extra_categories):
+    """构建与汇总Not Test完全同口径的明细集合。
+
+    主连接结果中的Not Test与NT-28/29/30/31外连记录全部合并到
+    `Not Test` Sheet；原有的细分Sheet仍作为穿透查看，不影响汇总口径。
+    """
+    if df_data is None:
+        df_data = pd.DataFrame()
+    if 'AQPP可分类' in df_data.columns:
+        matched_mask = df_data['AQPP可分类'].fillna(False).astype(bool)
+    else:
+        matched_mask = df_data.get(
+            'AQPP分类', pd.Series('', index=df_data.index)
+        ).ne('Not Test')
+    parts = [df_data.loc[~matched_mask].copy()]
+    consumed_names = set()
+    descriptions = {
+        'NT-28': '仅订单',
+        'NT-29': '仅发运单',
+        'NT-30': '仅开票',
+        'NT-31': '仅订单及发运单',
+    }
+    for category_name, nt_code in SUMMARY_EXTRA_NT.items():
+        if category_name in consumed_names:
+            continue
+        frame = (extra_categories or {}).get(category_name)
+        if frame is None or frame.empty:
+            continue
+        consumed_names.add(category_name)
+        if category_name in {'仅发货单', '仅发运单'}:
+            consumed_names.update({'仅发货单', '仅发运单'})
+        elif category_name in {'仅订单及发货单', '仅订单及发运单'}:
+            consumed_names.update({'仅订单及发货单', '仅订单及发运单'})
+        part = frame.copy()
+        part['AQPP场景编码'] = nt_code
+        part['AQPP场景描述'] = descriptions[nt_code]
+        part['AQPP分类'] = 'Not Test'
+        part['AQPP可分类'] = False
+        parts.append(part)
+    return pd.concat(parts, ignore_index=True, sort=False)
+
+
 def export_with_classification(df_data, output_file, file_label='',
                                amount_col=None, amount_label='开票金额',
                                order_inv_diff_col=None, inv_minus_order_col=None,
@@ -728,7 +779,10 @@ def export_with_classification(df_data, output_file, file_label='',
                 _write_detail_sheets(w, prepared, category, EXCEL_MAX)
 
     # 其他未匹配：Not Test + 仅订单/发货等 outer-join + 特殊发票
-    not_test_detail = _prepare_detail_frame(df_data.loc[~matched_mask], drop_cols)
+    not_test_detail = _prepare_detail_frame(
+        build_full_not_test_detail(df_data, extra_categories),
+        drop_cols,
+    )
     unmatched_sheets = []
     if not not_test_detail.empty:
         unmatched_sheets.append(('Not Test', not_test_detail))
