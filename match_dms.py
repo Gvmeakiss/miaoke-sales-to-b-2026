@@ -21,11 +21,12 @@ def main():
         split_registered_cancellation_rows,
     )
     from data_standardization import normalize_identifier
-    from scenario_utils import assign_parallel_scenarios
+    from scenario_utils import assign_existing_not_test_scenarios, assign_parallel_scenarios
     from invoice_type_policy import (
         aggregate_with_selective_unique_join,
         apply_invoice_type_policy,
         join_unique,
+        select_policy_excluded_for_not_test,
     )
     from export_utils import export_with_classification
     from pipeline_common import filter_order_status, filter_target_year, load_preprocessed_sources, nonblank
@@ -84,6 +85,7 @@ def main():
     if not cancellation_summary.empty:
         print(f"  冲销处理组数: {int(cancellation_summary['配对组数'].sum()):,}")
     print(f"  DMS 发票行数: {len(df_invoice_dms):,}")
+    df_invoice_policy_excluded = select_policy_excluded_for_not_test(df_invoice_review)
 
     # ============================================================================
     # 3. 聚合（DMS 订单 + 物料编码）
@@ -126,12 +128,35 @@ def main():
     df_invoice_dms[dms_order_col] = normalize_identifier(df_invoice_dms[dms_order_col])
     df_invoice_dms[material_col] = normalize_identifier(df_invoice_dms[material_col])
 
-    # 政策允许与“键可聚合”是两层口径。键缺失的发票不得被groupby静默丢弃，
-    # 必须保留在NT-30及PBC桥接中。
-    df_invoice_policy_allowed = df_invoice_dms
+    # 普通AQPP准入与Not Test金额完整性是两层口径。所有发票均纳入汇总；
+    # 不执行普通AQPP的发票按实际三单存在关系进入现有NT-00/28~33。
+    df_invoice_aqpp_scope = df_invoice_dms
     valid_invoice_key = df_invoice_dms[dms_order_col].notna() & df_invoice_dms[material_col].notna()
-    df_invoice_invalid_key = df_invoice_dms.loc[~valid_invoice_key].copy()
+    df_invoice_invalid_key_aqpp = df_invoice_dms.loc[~valid_invoice_key].copy()
     df_invoice_dms = df_invoice_dms.loc[valid_invoice_key].copy()
+
+    for column in (amount_col, untaxed_amount_col, quantity_sales_col, quantity_base_col):
+        if column and column in df_invoice_policy_excluded.columns:
+            df_invoice_policy_excluded[column] = pd.to_numeric(
+                df_invoice_policy_excluded[column], errors='coerce'
+            )
+    df_invoice_policy_excluded[dms_order_col] = normalize_identifier(
+        df_invoice_policy_excluded[dms_order_col]
+    )
+    df_invoice_policy_excluded[material_col] = normalize_identifier(
+        df_invoice_policy_excluded[material_col]
+    )
+    valid_review_key = (
+        df_invoice_policy_excluded[dms_order_col].notna()
+        & df_invoice_policy_excluded[material_col].notna()
+    )
+    df_invoice_review_invalid_key = df_invoice_policy_excluded.loc[~valid_review_key].copy()
+    df_invoice_review_valid = df_invoice_policy_excluded.loc[valid_review_key].copy()
+    df_invoice_invalid_key = pd.concat(
+        [df_invoice_invalid_key_aqpp, df_invoice_review_invalid_key],
+        ignore_index=True,
+        sort=False,
+    )
 
     # 发票聚合：金额和数量用sum，其他字段用first保留
     invoice_agg_dict = {
@@ -204,6 +229,30 @@ def main():
     pivot_invoice['SAP开票销售数量'] = pivot_invoice['SAP开票销售数量'].round(2)
     pivot_invoice['SAP开票基本数量'] = pivot_invoice['SAP开票基本数量'].round(2)
     print(f"  发票聚合: {len(pivot_invoice):,} 条")
+
+    pivot_invoice_review = aggregate_with_selective_unique_join(
+        df_invoice_review_valid,
+        [dms_order_col, material_col],
+        invoice_agg_dict,
+        selective_join_columns,
+    ) if not df_invoice_review_valid.empty else pd.DataFrame()
+    if not pivot_invoice_review.empty:
+        pivot_invoice_review.rename(columns={
+            dms_order_col: 'DMS订单',
+            material_col: '物料编码',
+            amount_col: 'SAP开票含税金额',
+            **({untaxed_amount_col: 'SAP开票不含税金额'} if untaxed_amount_col else {}),
+            quantity_sales_col: 'SAP开票销售数量',
+            quantity_base_col: 'SAP开票基本数量',
+        }, inplace=True)
+        for col in invoice_extra_cols:
+            if col in pivot_invoice_review.columns:
+                pivot_invoice_review.rename(columns={col: invoice_extra_map[col]}, inplace=True)
+        for column in ('SAP开票含税金额', 'SAP开票销售数量', 'SAP开票基本数量'):
+            pivot_invoice_review[column] = pd.to_numeric(
+                pivot_invoice_review[column], errors='coerce'
+            ).round(2)
+    print(f"  不执行普通AQPP发票聚合: {len(pivot_invoice_review):,} 条")
 
     # 订单聚合
     df_order_dms['pay_amount'] = pd.to_numeric(df_order_dms['pay_amount'], errors='coerce')
@@ -316,10 +365,32 @@ def main():
     ].isna().any(axis=1)
     df_join = assign_parallel_scenarios(df_join, channel='DMS')
 
-    # df_nottested: 订单+发货 无发票（DMS 订单 outer join 发货 outer join 发票，过滤无开票）
+    if not pivot_invoice_review.empty:
+        df_review_join = pivot_invoice_review.merge(
+            pivot_order, on=['DMS订单', '物料编码'], how='left'
+        ).merge(pivot_delivery, on=['DMS订单', '物料编码'], how='left')
+        df_review_join['SAP-DMS订单金额'] = (
+            df_review_join['SAP开票含税金额'] - df_review_join['DMS订单金额']
+        ).round(2)
+        df_review_join['SAP-DMS订单数量(基本单位)'] = (
+            df_review_join['SAP开票基本数量'] - df_review_join['DMS订单数量']
+        ).round(2)
+        df_review_join['SAP-DMS发货数量(基本单位)'] = (
+            df_review_join['SAP开票基本数量'] - df_review_join['DMS发货数量']
+        ).round(2)
+        df_review_join['SAP-DMS发货数量'] = df_review_join['SAP-DMS发货数量(基本单位)']
+        df_review_join = assign_existing_not_test_scenarios(df_review_join, channel='DMS')
+        df_join = pd.concat([df_join, df_review_join], ignore_index=True, sort=False)
+
+    # df_nottested只保留真正无任何渠道发票的订单/发运键；被排除发票已进入现有NT分类。
     df_nottested = pivot_order.merge(pivot_delivery, on=['DMS订单', '物料编码'], how='outer')
-    df_nottested = df_nottested.merge(pivot_invoice, on=['DMS订单', '物料编码'], how='outer')
-    df_nottested = df_nottested[df_nottested['SAP开票基本数量'].isna()].copy()
+    invoice_presence = pd.concat([
+        pivot_invoice[['DMS订单', '物料编码']],
+        pivot_invoice_review[['DMS订单', '物料编码']] if not pivot_invoice_review.empty else pd.DataFrame(columns=['DMS订单', '物料编码']),
+    ], ignore_index=True).drop_duplicates()
+    invoice_presence['_存在渠道发票'] = True
+    df_nottested = df_nottested.merge(invoice_presence, on=['DMS订单', '物料编码'], how='left')
+    df_nottested = df_nottested[df_nottested['_存在渠道发票'].isna()].drop(columns=['_存在渠道发票']).copy()
 
     # 已识别冲销业务键不能在删除冲销发票后重新落入“仅订单及发货单”。
     if not cancellation_registry.empty:
@@ -345,16 +416,21 @@ def main():
         extra_categories['已冲销净额0'] = cancellation_outer.loc[exact_mask].copy()
         extra_categories['冲销业务待确认'] = cancellation_outer.loc[~exact_mask].copy()
 
-    # 统一统计粒度：清单行数/SAP发票数来自政策允许发票，匹配键数来自聚合结果。
+    # 金额核对范围=普通AQPP准入发票+政策排除发票；冲销前置记录保持原逻辑。
+    df_invoice_reporting_scope = pd.concat(
+        [df_invoice_aqpp_scope, df_invoice_policy_excluded],
+        ignore_index=True,
+        sort=False,
+    )
     invoice_no_col = next(
-        (column for column in ('SAP发票号', 'SAP发票编号') if column in df_invoice_policy_allowed.columns),
+        (column for column in ('SAP发票号', 'SAP发票编号') if column in df_invoice_reporting_scope.columns),
         None,
     )
     invoice_stats = {
-        '清单行数': len(df_invoice_policy_allowed),
-        'SAP发票数': int(df_invoice_policy_allowed[invoice_no_col].nunique()) if invoice_no_col else 0,
-        '匹配键数': len(pivot_invoice),
-        '发票金额': float(pd.to_numeric(df_invoice_policy_allowed[amount_col], errors='coerce').sum()),
+        '清单行数': len(df_invoice_reporting_scope),
+        'SAP发票数': int(df_invoice_reporting_scope[invoice_no_col].nunique()) if invoice_no_col else 0,
+        '匹配键数': len(pivot_invoice) + len(pivot_invoice_review),
+        '发票金额': float(pd.to_numeric(df_invoice_reporting_scope[amount_col], errors='coerce').sum()),
     }
 
     print('  AQPP分类统计:')
@@ -392,7 +468,7 @@ def main():
         special_invoices=df_invoice_review,
         invoice_inventory=df_invoice_inventory,
         aqpp_input_invoices=df_invoice_dms,
-        invalid_key_invoices=df_invoice_invalid_key,
+        invalid_key_invoices=df_invoice_invalid_key_aqpp,
         cancellation_details=cancellation_details,
         cancellation_summary=cancellation_summary,
         summary_file=str(out_summary),

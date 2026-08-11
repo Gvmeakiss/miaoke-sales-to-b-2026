@@ -28,15 +28,36 @@ SUMMARY_EXTRA_NT = {
 }
 
 
+# OMS Not Test统一展示标准字段，避免只有“仅发票”记录落在原始列、
+# 其余记录落在聚合列，导致同一Sheet内对金额和数量求和时口径不完整。
+OMS_NOT_TEST_RAW_DUPLICATE_COLUMNS = [
+    '实际金额（ZFN1）',
+    '含税金额',
+    '无税金额',
+    '开票数量（基本单位数量）',
+    'SAP发票号',
+    'SAP发票编号',
+]
+
+
 def add_company_code(df):
-    """建立展示用公司代码；缺失值单列为“公司代码缺失”，不丢弃记录。"""
+    """逐行建立展示用公司代码，而不是为整张表只选一个来源列。"""
     out = df.copy()
-    source = next((column for column in ('公司代码', '发票-公司代码', '发票-销售组织', '销售组织') if column in out.columns), None)
-    if source:
-        company = out[source].astype('string').str.strip().str.replace(r'\.0$', '', regex=True)
-        out['公司代码'] = company.fillna('公司代码缺失').replace('', '公司代码缺失')
-    else:
-        out['公司代码'] = '公司代码缺失'
+    company = pd.Series(pd.NA, index=out.index, dtype='string')
+    for column in ('公司代码', '发票-公司代码', '发票-销售组织', '销售组织'):
+        if column not in out.columns:
+            continue
+        candidate = (
+            out[column].astype('string').str.strip().str.replace(r'\.0$', '', regex=True)
+        ).replace({
+            '': pd.NA,
+            '公司代码缺失': pd.NA,
+            'N/A': pd.NA,
+            'nan': pd.NA,
+            '<NA>': pd.NA,
+        })
+        company = company.fillna(candidate)
+    out['公司代码'] = company.fillna('公司代码缺失')
     return out
 
 
@@ -56,11 +77,17 @@ def _group_summary(df, group_columns, amount_col, invoice_total_amount):
     return summary
 
 
-def build_overall_summary(df, amount_col, invoice_total_amount):
-    """按场景大类生成总体汇总并追加总计。"""
+def build_overall_summary(df, amount_col, invoice_total_amount, aqpp_total_amount=None):
+    """按场景大类生成总体汇总，并将渠道勾稽占比与AQPP口径分开。"""
     category_col = 'AQPP分类' if 'AQPP分类' in df.columns else '场景分类'
     summary = _group_summary(df, [category_col], amount_col, invoice_total_amount)
     summary = summary.rename(columns={category_col: '场景分类'})
+    summary['AQPP范围金额占比'] = summary.apply(
+        lambda row: calculate_invoice_amount_share(row['发票金额'], aqpp_total_amount)
+        if row['场景分类'] != 'Not Test' and aqpp_total_amount is not None
+        else '',
+        axis=1,
+    )
     total = pd.DataFrame([{
         '场景分类': '总计',
         '记录数': len(df),
@@ -70,6 +97,7 @@ def build_overall_summary(df, amount_col, invoice_total_amount):
             pd.to_numeric(df[amount_col], errors='coerce').fillna(0).sum() if amount_col in df.columns else 0,
             invoice_total_amount,
         ),
+        'AQPP范围金额占比': '',
     }])
     return pd.concat([summary, total], ignore_index=True)
 
@@ -173,6 +201,7 @@ def build_invoice_scope_bridge(
     amount_label,
     aqpp_input_invoices=None,
     invalid_key_invoices=None,
+    separate_exclusions=False,
 ):
     """桥接PBC至正式聚合输入，并将政策剔除与关键键缺失分开披露。"""
     columns = ['桥接项目', '清单行数', 'SAP发票数', '发票不含税金额', '发票金额']
@@ -228,6 +257,28 @@ def build_invoice_scope_bridge(
     policy_row = bridge_row('2. 政策允许（冲销处理后）', policy_allowed)
     aqpp_row = bridge_row('3. 匹配键完整的正式聚合输入', formal_input)
     invalid_row = bridge_row('4. 政策允许但匹配键缺失', invalid_keys)
+    if separate_exclusions and '冲销处理编码' in excluded.columns:
+        cancellation_mask = excluded['冲销处理编码'].notna()
+        policy_row_excluded = bridge_row(
+            '5. 政策排除（未执行普通AQPP）',
+            excluded.loc[~cancellation_mask],
+        )
+        cancellation_row = bridge_row(
+            '6. 冲销前置处理',
+            excluded.loc[cancellation_mask],
+        )
+        check = {
+            '桥接项目': '7. 校验差额（1-3-4-5-6）',
+            '清单行数': raw_row['清单行数'] - aqpp_row['清单行数'] - invalid_row['清单行数'] - policy_row_excluded['清单行数'] - cancellation_row['清单行数'],
+            'SAP发票数': '',
+            '发票不含税金额': round(raw_row['发票不含税金额'] - aqpp_row['发票不含税金额'] - invalid_row['发票不含税金额'] - policy_row_excluded['发票不含税金额'] - cancellation_row['发票不含税金额'], 2),
+            '发票金额': round(raw_row['发票金额'] - aqpp_row['发票金额'] - invalid_row['发票金额'] - policy_row_excluded['发票金额'] - cancellation_row['发票金额'], 2),
+        }
+        return pd.DataFrame(
+            [raw_row, policy_row, aqpp_row, invalid_row, policy_row_excluded, cancellation_row, check],
+            columns=columns,
+        )
+
     excluded_row = bridge_row('5. 政策或冲销前置排除', excluded)
     check = {
         '桥接项目': '6. 校验差额（1-3-4-5）',
@@ -488,19 +539,24 @@ def _prepare_detail_frame(frame, drop_cols=None):
 def _invoice_stats_values(invoice_stats):
     """兼容旧tuple，并统一返回清单行数、发票数、匹配键数及金额。"""
     if invoice_stats is None:
-        return {'清单行数': 0, 'SAP发票数': 0, '匹配键数': 0, '发票金额': 0.0}
+        return {'清单行数': 0, 'SAP发票数': 0, '匹配键数': 0, '发票金额': 0.0, 'AQPP范围发票金额': None}
     if isinstance(invoice_stats, dict):
         return {
             '清单行数': int(invoice_stats.get('清单行数', 0)),
             'SAP发票数': int(invoice_stats.get('SAP发票数', 0)),
             '匹配键数': int(invoice_stats.get('匹配键数', 0)),
             '发票金额': float(invoice_stats.get('发票金额', 0.0)),
+            'AQPP范围发票金额': (
+                float(invoice_stats['AQPP范围发票金额'])
+                if invoice_stats.get('AQPP范围发票金额') is not None else None
+            ),
         }
     return {
         '清单行数': int(invoice_stats[0]),
         'SAP发票数': 0,
         '匹配键数': 0,
         '发票金额': float(invoice_stats[1]),
+        'AQPP范围发票金额': None,
     }
 
 
@@ -558,6 +614,48 @@ def build_summary_scope(df_data, extra_categories, amount_col):
     return pd.concat(parts, ignore_index=True, sort=False)
 
 
+def build_full_not_test_detail(df_data, extra_categories):
+    """构建与汇总Not Test完全同口径的明细集合。
+
+    主连接结果中的Not Test与NT-28/29/30/31外连记录全部合并到
+    `Not Test` Sheet；原有的细分Sheet仍作为穿透查看，不影响汇总口径。
+    """
+    if df_data is None:
+        df_data = pd.DataFrame()
+    if 'AQPP可分类' in df_data.columns:
+        matched_mask = df_data['AQPP可分类'].fillna(False).astype(bool)
+    else:
+        matched_mask = df_data.get(
+            'AQPP分类', pd.Series('', index=df_data.index)
+        ).ne('Not Test')
+    parts = [df_data.loc[~matched_mask].copy()]
+    consumed_names = set()
+    descriptions = {
+        'NT-28': '仅订单',
+        'NT-29': '仅发运单',
+        'NT-30': '仅开票',
+        'NT-31': '仅订单及发运单',
+    }
+    for category_name, nt_code in SUMMARY_EXTRA_NT.items():
+        if category_name in consumed_names:
+            continue
+        frame = (extra_categories or {}).get(category_name)
+        if frame is None or frame.empty:
+            continue
+        consumed_names.add(category_name)
+        if category_name in {'仅发货单', '仅发运单'}:
+            consumed_names.update({'仅发货单', '仅发运单'})
+        elif category_name in {'仅订单及发货单', '仅订单及发运单'}:
+            consumed_names.update({'仅订单及发货单', '仅订单及发运单'})
+        part = frame.copy()
+        part['AQPP场景编码'] = nt_code
+        part['AQPP场景描述'] = descriptions[nt_code]
+        part['AQPP分类'] = 'Not Test'
+        part['AQPP可分类'] = False
+        parts.append(part)
+    return pd.concat(parts, ignore_index=True, sort=False)
+
+
 def export_with_classification(df_data, output_file, file_label='',
                                amount_col=None, amount_label='开票金额',
                                order_inv_diff_col=None, inv_minus_order_col=None,
@@ -571,6 +669,7 @@ def export_with_classification(df_data, output_file, file_label='',
                                invoice_matchability_summary=None,
                                cancellation_details=None,
                                cancellation_summary=None,
+                               separate_bridge_exclusions=False,
                                summary_file=None,
                                detail_file=None,
                                unmatched_file=None):
@@ -603,7 +702,12 @@ def export_with_classification(df_data, output_file, file_label='',
         float(pd.to_numeric(df_data[amount_col], errors='coerce').sum()) if amount_col and amount_col in df_data.columns else 0.0
     )
     df_summary_scope = add_company_code(build_summary_scope(df_data, extra_categories, amount_col))
-    df_overall_summary = build_overall_summary(df_summary_scope, amount_col, invoice_total_amount)
+    df_overall_summary = build_overall_summary(
+        df_summary_scope,
+        amount_col,
+        invoice_total_amount,
+        aqpp_total_amount=stats_values.get('AQPP范围发票金额'),
+    )
     df_company_summary = build_company_summary(df_summary_scope, amount_col, invoice_total_amount)
     df_company_scenario = build_company_scenario_summary(df_summary_scope, amount_col, invoice_total_amount)
     df_invoice_inventory_summary = build_invoice_inventory_summary(
@@ -614,6 +718,7 @@ def export_with_classification(df_data, output_file, file_label='',
         amount_label,
         aqpp_input_invoices=aqpp_input_invoices,
         invalid_key_invoices=invalid_key_invoices,
+        separate_exclusions=separate_bridge_exclusions,
     )
     df_aqpp_scenario_report = build_aqpp_scenario_report(
         df_summary_scope,
@@ -686,7 +791,13 @@ def export_with_classification(df_data, output_file, file_label='',
                 _write_detail_sheets(w, prepared, category, EXCEL_MAX)
 
     # 其他未匹配：Not Test + 仅订单/发货等 outer-join + 特殊发票
-    not_test_detail = _prepare_detail_frame(df_data.loc[~matched_mask], drop_cols)
+    not_test_drop_cols = list(drop_cols or [])
+    if str(file_label).strip().upper() == 'OMS':
+        not_test_drop_cols.extend(OMS_NOT_TEST_RAW_DUPLICATE_COLUMNS)
+    not_test_detail = _prepare_detail_frame(
+        build_full_not_test_detail(df_data, extra_categories),
+        not_test_drop_cols,
+    )
     unmatched_sheets = []
     if not not_test_detail.empty:
         unmatched_sheets.append(('Not Test', not_test_detail))

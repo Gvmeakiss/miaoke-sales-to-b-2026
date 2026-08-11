@@ -10,6 +10,7 @@ from config import (
     INVOICE_DESCRIPTION_RULES,
     INVOICE_TYPE_DEFAULT_ACTION,
     INVOICE_TYPE_RULES,
+    PBC_INVOICE_SCOPE_TYPES,
 )
 from data_standardization import first_existing_column, normalize_identifier
 
@@ -70,6 +71,48 @@ def join_unique(values) -> str:
         if pd.notna(value) and str(value).strip()
     )
     return '|'.join(dict.fromkeys(cleaned))
+
+
+def select_policy_excluded_for_not_test(review_invoices: pd.DataFrame) -> pd.DataFrame:
+    """仅返回发票类型规则排除、且未进入冲销前置处理的发票。
+
+    已有冲销处理编码的记录继续沿用冲销配对、净额和业务键分流逻辑，不进入
+    普通Not Test；无冲销处理编码的待确认类型才按三单存在关系进入现有NT编码。
+    """
+    if review_invoices is None or review_invoices.empty:
+        return pd.DataFrame() if review_invoices is None else review_invoices.copy()
+    if '冲销处理编码' not in review_invoices.columns:
+        return review_invoices.copy()
+    return review_invoices.loc[review_invoices['冲销处理编码'].isna()].copy()
+
+
+def select_tob_oms_reporting_scope(invoice_inventory: pd.DataFrame) -> pd.DataFrame:
+    """限定ToB-OMS匹配与金额核对范围。
+
+    保留两类记录：
+    1. 按当前AQPP发票类型政策可参与匹配的类型，以保持既有OMS匹配范围；
+    2. PBC业务范围明确归属ToB-OMS的政策排除类型，供现有Not Test展示。
+
+    ToC和“其他”中不参与AQPP的类型不得因DMS销售单号为空而进入
+    ToB-OMS的Not Test、发票类型汇总或匹配率分母。
+    """
+    if invoice_inventory is None or invoice_inventory.empty:
+        return pd.DataFrame() if invoice_inventory is None else invoice_inventory.copy()
+    code_col = first_existing_column(
+        invoice_inventory,
+        ('发票类型代码规范', '发票类型', '发票类型代码'),
+    )
+    if code_col is None:
+        return invoice_inventory.iloc[0:0].copy()
+    normalized_code = normalize_identifier(invoice_inventory[code_col])
+    aqpp_type_codes = {
+        code for code, rule in INVOICE_TYPE_RULES.items()
+        if rule.get('action') in {'正常参与匹配', '特殊场景参与匹配'}
+    }
+    tob_oms_codes = set(PBC_INVOICE_SCOPE_TYPES.get('ToB-OMS', set()))
+    return invoice_inventory.loc[
+        normalized_code.isin(aqpp_type_codes | tob_oms_codes)
+    ].copy()
 
 
 def aggregate_with_selective_unique_join(

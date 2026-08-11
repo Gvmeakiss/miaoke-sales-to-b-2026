@@ -15,10 +15,48 @@ from invoice_matchability import (
     build_oms_invoice_type_matchability,
     build_oms_order_item_key,
 )
-from scenario_utils import assign_parallel_scenarios
-from invoice_type_policy import apply_invoice_type_policy, join_unique
+from scenario_utils import assign_existing_not_test_scenarios, assign_parallel_scenarios
+from invoice_type_policy import (
+    apply_invoice_type_policy,
+    join_unique,
+    select_policy_excluded_for_not_test,
+    select_tob_oms_reporting_scope,
+)
 from export_utils import export_with_classification
 from pipeline_common import filter_order_status, filter_target_year, load_preprocessed_sources, nonblank
+
+
+OMS_INVOICE_DISPLAY_FIELD_SOURCES = (
+    ('开票金额', ('实际金额（ZFN1）',), True),
+    ('发票含税金额', ('含税金额',), True),
+    ('发票不含税金额', ('无税金额',), True),
+    ('开票数量', ('开票数量（基本单位数量）',), True),
+    ('发票-SAP发票号', ('SAP发票号', 'SAP发票编号'), False),
+    ('发票-销售组织', ('销售组织', '销售组织代码'), False),
+    ('发票-发票类型', ('发票类型', '发票类型.1', '发票类型代码规范'), False),
+    ('发票-开票日期', ('开票记账日期', '发票创建日期', '开票日期', '发票日期'), False),
+)
+
+
+def add_oms_invoice_display_fields(frame):
+    """补齐OMS导出标准字段；只影响展示，不改变匹配输入或场景分类。"""
+    if frame is None:
+        return pd.DataFrame()
+    out = frame.copy()
+    for target, candidates, numeric in OMS_INVOICE_DISPLAY_FIELD_SOURCES:
+        source = first_existing_column(out, candidates)
+        if source is None:
+            continue
+        values = pd.to_numeric(out[source], errors='coerce') if numeric else out[source]
+        if target not in out.columns:
+            out[target] = values
+            continue
+        if numeric:
+            current = pd.to_numeric(out[target], errors='coerce')
+        else:
+            current = out[target].replace(r'^\s*$', pd.NA, regex=True)
+        out[target] = current.fillna(values)
+    return out
 
 def _normalize_material_code(ser):
     """物料/料号/item 转字符串并去掉因 float 产生的 '.0'。"""
@@ -73,6 +111,7 @@ def main():
     df_invoice = apply_invoice_type_policy(
         df_invoice.loc[~nonblank(df_invoice['DMS销售单号'])]
     )
+    df_invoice = select_tob_oms_reporting_scope(df_invoice)
     df_invoice_inventory = df_invoice
     if CANCELLATION_PROCESSING_ENABLED:
         cancellation_result = preprocess_cancellations(
@@ -99,10 +138,13 @@ def main():
     print(f"  可参与匹配发票: {len(df_invoice):,} 行；待确认类型: {len(df_invoice_review):,} 行")
     if not cancellation_summary.empty:
         print(f"  冲销处理组数: {int(cancellation_summary['配对组数'].sum()):,}")
+    df_invoice_policy_excluded = select_policy_excluded_for_not_test(df_invoice_review)
 
     # 发票 → order-item
     inv_with_oms = pd.DataFrame()
-    df_invoice_invalid_key = pd.DataFrame()
+    review_with_oms = pd.DataFrame()
+    df_invoice_invalid_key_aqpp = pd.DataFrame()
+    df_invoice_review_invalid_key = pd.DataFrame()
     if oms_col in df_invoice.columns and mat_col in df_invoice.columns:
         oms_number = normalize_identifier(df_invoice[oms_col])
         material_number = _normalize_material_code(df_invoice[mat_col])
@@ -111,16 +153,30 @@ def main():
             & material_number.notna() & material_number.str.strip().ne('')
         )
         inv_with_oms = df_invoice[valid_invoice_key].copy()
-        df_invoice_invalid_key = df_invoice[~valid_invoice_key].copy()
-        if '实际金额（ZFN1）' in df_invoice_invalid_key.columns:
-            df_invoice_invalid_key['开票金额'] = pd.to_numeric(
-                df_invoice_invalid_key['实际金额（ZFN1）'], errors='coerce'
-            )
+        df_invoice_invalid_key_aqpp = add_oms_invoice_display_fields(
+            df_invoice[~valid_invoice_key]
+        )
         inv_with_oms['order-item'] = _build_order_item_key(
             inv_with_oms[oms_col], inv_with_oms[mat_col]
         )
 
+        review_oms_number = normalize_identifier(df_invoice_policy_excluded[oms_col])
+        review_material_number = _normalize_material_code(df_invoice_policy_excluded[mat_col])
+        valid_review_key = review_oms_number.notna() & review_material_number.notna()
+        review_with_oms = df_invoice_policy_excluded.loc[valid_review_key].copy()
+        df_invoice_review_invalid_key = add_oms_invoice_display_fields(
+            df_invoice_policy_excluded.loc[~valid_review_key]
+        )
+        review_with_oms['order-item'] = _build_order_item_key(
+            review_with_oms[oms_col], review_with_oms[mat_col]
+        )
+
     df_invoice_used = inv_with_oms
+    df_invoice_invalid_key = pd.concat(
+        [df_invoice_invalid_key_aqpp, df_invoice_review_invalid_key],
+        ignore_index=True,
+        sort=False,
+    )
 
     # 3. 匹配键
     print("\n创建匹配键 order-item...")
@@ -187,13 +243,20 @@ def main():
         df_invoice_used, ['开票数量（基本单位数量）'], required=True, label='开票基本单位数量'
     )
     untaxed_amount_col = first_existing_column(df_invoice_used, ['无税金额'])
+    taxed_amount_col = first_existing_column(df_invoice_used, ['含税金额'])
 
+    invoice_review_agg = pd.DataFrame()
     if df_invoice_used.empty or not amount_col or not quantity_col:
         invoice_agg = pd.DataFrame({'order-item': [], '开票金额': [], '开票数量': []})
     else:
         df_invoice_used[amount_col] = pd.to_numeric(df_invoice_used[amount_col], errors='coerce').round(2)
         df_invoice_used[quantity_col] = pd.to_numeric(df_invoice_used[quantity_col], errors='coerce').round(2)
         invoice_agg_dict = {amount_col: 'sum', quantity_col: 'sum'}
+        if taxed_amount_col and taxed_amount_col not in invoice_agg_dict:
+            df_invoice_used[taxed_amount_col] = pd.to_numeric(
+                df_invoice_used[taxed_amount_col], errors='coerce'
+            ).round(2)
+            invoice_agg_dict[taxed_amount_col] = 'sum'
         if untaxed_amount_col:
             df_invoice_used[untaxed_amount_col] = pd.to_numeric(
                 df_invoice_used[untaxed_amount_col], errors='coerce'
@@ -209,11 +272,10 @@ def main():
             (['标准-发票币种'], '标准-发票币种'),
             (['标准-发票数量单位'], '标准-发票数量单位'),
         ]:
-            for col in df_invoice_used.columns:
-                if any(c in str(col) for c in candidates) and col not in invoice_agg_dict:
-                    invoice_agg_dict[col] = join_unique if label == '发票-发票类型' else 'first'
-                    invoice_extra_map[col] = label
-                    break
+            col = first_existing_column(df_invoice_used, candidates)
+            if col and col not in invoice_agg_dict:
+                invoice_agg_dict[col] = join_unique if label == '发票-发票类型' else 'first'
+                invoice_extra_map[col] = label
         for policy_column in (
             '发票类型代码规范', '发票类型描述规范', '发票类型处理方式',
             '发票类型业务分类', '发票金额方向处理', '冲销处理编码',
@@ -232,9 +294,26 @@ def main():
         invoice_agg.rename(columns={
             amount_col: '开票金额',
             quantity_col: '开票数量',
+            **({taxed_amount_col: '发票含税金额'} if taxed_amount_col else {}),
             **({untaxed_amount_col: '发票不含税金额'} if untaxed_amount_col else {}),
             **invoice_extra_map,
         }, inplace=True)
+        if not review_with_oms.empty:
+            for column in (amount_col, quantity_col, taxed_amount_col, untaxed_amount_col):
+                if column and column in review_with_oms.columns:
+                    review_with_oms[column] = pd.to_numeric(
+                        review_with_oms[column], errors='coerce'
+                    ).round(2)
+            invoice_review_agg = review_with_oms.groupby('order-item', as_index=False).agg(
+                invoice_agg_dict
+            )
+            invoice_review_agg.rename(columns={
+                amount_col: '开票金额',
+                quantity_col: '开票数量',
+                **({taxed_amount_col: '发票含税金额'} if taxed_amount_col else {}),
+                **({untaxed_amount_col: '发票不含税金额'} if untaxed_amount_col else {}),
+                **invoice_extra_map,
+            }, inplace=True)
     for c in ['开票金额', '开票数量']:
         if c not in invoice_agg.columns:
             invoice_agg[c] = pd.Series(dtype=float)
@@ -242,10 +321,49 @@ def main():
     # 5. 匹配与分类
     df_matched = invoice_agg.merge(delivery_agg, on='order-item', how='left')
     df_matched = df_matched.merge(order_agg, on='order-item', how='left')
-    df_nottested = order_agg.merge(delivery_agg, on='order-item', how='outer')
-    df_nottested = df_nottested.merge(invoice_agg, on='order-item', how='outer')
-    df_nottested = df_nottested[df_nottested['开票数量'].isna()]
 
+    df_matched['订单-发货数量'] = pd.to_numeric(df_matched['订单数量'], errors='coerce') - pd.to_numeric(df_matched['发货数量'], errors='coerce')
+    df_matched['订单-开票数量'] = pd.to_numeric(df_matched['订单数量'], errors='coerce') - pd.to_numeric(df_matched['开票数量'], errors='coerce')
+    df_matched['发货-开票数量'] = pd.to_numeric(df_matched['发货数量'], errors='coerce') - pd.to_numeric(df_matched['开票数量'], errors='coerce')
+    df_matched['订单-发票金额'] = (pd.to_numeric(df_matched['订单金额'], errors='coerce') - pd.to_numeric(df_matched['开票金额'], errors='coerce')).round(2)
+
+    key_cols = ['订单金额', '订单数量', '发货数量', '开票金额', '开票数量']
+    df_matched['2.Not test'] = df_matched[key_cols].isna().any(axis=1)
+    df_matched = assign_parallel_scenarios(df_matched, channel='OMS')
+
+    if not invoice_review_agg.empty:
+        df_review_matched = invoice_review_agg.merge(
+            delivery_agg, on='order-item', how='left'
+        ).merge(order_agg, on='order-item', how='left')
+        df_review_matched['订单-发货数量'] = pd.to_numeric(
+            df_review_matched['订单数量'], errors='coerce'
+        ) - pd.to_numeric(df_review_matched['发货数量'], errors='coerce')
+        df_review_matched['订单-开票数量'] = pd.to_numeric(
+            df_review_matched['订单数量'], errors='coerce'
+        ) - pd.to_numeric(df_review_matched['开票数量'], errors='coerce')
+        df_review_matched['发货-开票数量'] = pd.to_numeric(
+            df_review_matched['发货数量'], errors='coerce'
+        ) - pd.to_numeric(df_review_matched['开票数量'], errors='coerce')
+        df_review_matched['订单-发票金额'] = (
+            pd.to_numeric(df_review_matched['订单金额'], errors='coerce')
+            - pd.to_numeric(df_review_matched['开票金额'], errors='coerce')
+        ).round(2)
+        df_review_matched = assign_existing_not_test_scenarios(
+            df_review_matched, channel='OMS'
+        )
+        df_matched = pd.concat([df_matched, df_review_matched], ignore_index=True, sort=False)
+
+    # 仅保留真正没有任何OMS渠道发票的订单/发运键。
+    df_nottested = order_agg.merge(delivery_agg, on='order-item', how='outer')
+    invoice_presence = pd.concat([
+        invoice_agg[['order-item']],
+        invoice_review_agg[['order-item']] if not invoice_review_agg.empty else pd.DataFrame(columns=['order-item']),
+    ], ignore_index=True).drop_duplicates()
+    invoice_presence['_存在渠道发票'] = True
+    df_nottested = df_nottested.merge(invoice_presence, on='order-item', how='left')
+    df_nottested = df_nottested.loc[
+        df_nottested['_存在渠道发票'].isna()
+    ].drop(columns=['_存在渠道发票']).copy()
     registry_for_join = cancellation_registry.copy()
     if not registry_for_join.empty:
         registry_for_join['order-item'] = _build_order_item_key(
@@ -258,15 +376,6 @@ def main():
         )
     else:
         cancellation_outer = pd.DataFrame()
-
-    df_matched['订单-发货数量'] = pd.to_numeric(df_matched['订单数量'], errors='coerce') - pd.to_numeric(df_matched['发货数量'], errors='coerce')
-    df_matched['订单-开票数量'] = pd.to_numeric(df_matched['订单数量'], errors='coerce') - pd.to_numeric(df_matched['开票数量'], errors='coerce')
-    df_matched['发货-开票数量'] = pd.to_numeric(df_matched['发货数量'], errors='coerce') - pd.to_numeric(df_matched['开票数量'], errors='coerce')
-    df_matched['订单-发票金额'] = (pd.to_numeric(df_matched['订单金额'], errors='coerce') - pd.to_numeric(df_matched['开票金额'], errors='coerce')).round(2)
-
-    key_cols = ['订单金额', '订单数量', '发货数量', '开票金额', '开票数量']
-    df_matched['2.Not test'] = df_matched[key_cols].isna().any(axis=1)
-    df_matched = assign_parallel_scenarios(df_matched, channel='OMS')
 
     print("\nAQPP分类统计:")
     for category in ['完全匹配', '金额差异', '数量差异', '数量+金额差异', 'Not Test']:
@@ -296,15 +405,21 @@ def main():
     amt_col_inv = amount_col if amount_col else next(
         (c for c in df_invoice_used.columns if '实际金额' in str(c) or ('金额' in str(c) and 'ZFN1' in str(c))), None
     )
+    df_invoice_reporting_scope = pd.concat(
+        [df_invoice, df_invoice_policy_excluded],
+        ignore_index=True,
+        sort=False,
+    )
     invoice_no_col = next(
-        (column for column in ('SAP发票号', 'SAP发票编号') if column in df_invoice.columns),
+        (column for column in ('SAP发票号', 'SAP发票编号') if column in df_invoice_reporting_scope.columns),
         None,
     )
     invoice_stats = {
-        '清单行数': len(df_invoice),
-        'SAP发票数': int(df_invoice[invoice_no_col].nunique()) if invoice_no_col else 0,
-        '匹配键数': len(invoice_agg),
-        '发票金额': float(pd.to_numeric(df_invoice[amt_col_inv], errors='coerce').sum()) if amt_col_inv and amt_col_inv in df_invoice.columns else 0.0,
+        '清单行数': len(df_invoice_reporting_scope),
+        'SAP发票数': int(df_invoice_reporting_scope[invoice_no_col].nunique()) if invoice_no_col else 0,
+        '匹配键数': len(invoice_agg) + len(invoice_review_agg),
+        '发票金额': float(pd.to_numeric(df_invoice_reporting_scope[amt_col_inv], errors='coerce').sum()) if amt_col_inv and amt_col_inv in df_invoice_reporting_scope.columns else 0.0,
+        'AQPP范围发票金额': float(pd.to_numeric(df_invoice[amt_col_inv], errors='coerce').sum()) if amt_col_inv and amt_col_inv in df_invoice.columns else 0.0,
     }
 
     # 8. 导出三份：汇总 / 明细(三单匹配) / 其他未匹配
@@ -324,10 +439,11 @@ def main():
         special_invoices=df_invoice_review,
         invoice_inventory=df_invoice_inventory,
         aqpp_input_invoices=df_invoice_used,
-        invalid_key_invoices=df_invoice_invalid_key,
+        invalid_key_invoices=df_invoice_invalid_key_aqpp,
         invoice_matchability_summary=oms_type_matchability,
         cancellation_details=cancellation_details,
         cancellation_summary=cancellation_summary,
+        separate_bridge_exclusions=True,
         summary_file=str(out_summary),
         detail_file=str(out_detail),
         unmatched_file=str(out_unmatched),

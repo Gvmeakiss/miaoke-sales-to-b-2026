@@ -32,10 +32,27 @@
 import pandas as pd
 import numpy as np
 
-from aqpp_scenarios import assign_aqpp_scenarios, map_aqpp_to_legacy
-from config import AMOUNT_TAIL_TOLERANCE, AMOUNT_TOLERANCE, QUANTITY_TOLERANCE
+from aqpp_scenarios import (
+    LEGACY_DESCRIPTIONS,
+    NOT_TEST_DESCRIPTIONS,
+    assign_aqpp_scenarios,
+    classify_not_test_presence,
+    map_aqpp_to_legacy,
+)
+from config import (
+    AMOUNT_TAIL_TOLERANCE,
+    AMOUNT_TOLERANCE,
+    DMS_AMOUNT_TOLERANCE_INCLUSIVE,
+    QUANTITY_TOLERANCE,
+)
 from reconciliation_measures import build_three_way_measures
-from tolerance_utils import absolute_greater_than, absolute_less_than, equal_with_tolerance, greater_with_tolerance
+from tolerance_utils import (
+    absolute_equal_to_boundary,
+    absolute_greater_than,
+    absolute_less_than,
+    equal_with_tolerance,
+    greater_with_tolerance,
+)
 
 QTY_TOL = QUANTITY_TOLERANCE
 AMT_TOL = AMOUNT_TOLERANCE
@@ -175,8 +192,13 @@ def assign_scenario_oms(df, qty_ord_inv_col='订单-开票数量', qty_ord_dlv_c
     return df
 
 
-def assign_scenario_dms(df, dms_order_qty_col='DMS订单数量', dms_dlv_qty_col='DMS发货数量',
-                       sap_qty_col='SAP开票基本数量', amt_diff_col='SAP-DMS订单金额'):
+def assign_scenario_dms(
+    df,
+    dms_order_qty_col='DMS订单数量',
+    dms_dlv_qty_col='DMS发货数量',
+    sap_qty_col='SAP开票基本数量',
+    amt_diff_col='SAP-DMS订单金额',
+):
     """
     为 DMS 匹配结果分配场景标号（1-13）、大类、细分场景。
     DMS 金额差异列 SAP-DMS订单金额 = 发票 - 订单，故 |SAP-DMS订单金额| = |订单-发票|。
@@ -189,7 +211,9 @@ def assign_scenario_dms(df, dms_order_qty_col='DMS订单数量', dms_dlv_qty_col
     amt_diff = -amt_diff_raw  # 转为 订单-发票 口径，与 OMS 一致
 
     amt_eq = absolute_less_than(amt_diff, AMT_TOL)
-    amt_outside = absolute_greater_than(amt_diff_raw, AMT_TOL)
+    # FY25兼容口径把=0.02视为“金额有差异”，并在去年格式汇总进入2.1尾差<1。
+    amount_boundary = absolute_equal_to_boundary(amt_diff_raw, AMT_TOL)
+    amt_outside = absolute_greater_than(amt_diff_raw, AMT_TOL) | amount_boundary
     # DMS 原逻辑：amt_diff_col=发票-订单，amt_lt=>发票>订单，amt_gt=>发票<订单
     amt_lt = amt_outside & amt_diff_raw.gt(0)
     amt_gt = amt_outside & amt_diff_raw.lt(0)
@@ -274,10 +298,37 @@ def assign_parallel_scenarios(df: pd.DataFrame, channel: str) -> pd.DataFrame:
     SIV/SOV，数量比较SIQ/SOQ/GDNQ。去年原始逻辑仅用于交叉验证。
     """
     out = build_three_way_measures(df, channel)
-    out = assign_aqpp_scenarios(out, AMOUNT_TOLERANCE, QUANTITY_TOLERANCE)
+    is_dms = channel.upper() == 'DMS'
+    include_amount_boundary = is_dms and DMS_AMOUNT_TOLERANCE_INCLUSIVE
+    if is_dms:
+        out['尾差0.02'] = absolute_equal_to_boundary(
+            out['SIV'].sub(out['SOV']), AMOUNT_TOLERANCE
+        ).map({True: '是', False: '否'})
+    out = assign_aqpp_scenarios(
+        out,
+        AMOUNT_TOLERANCE,
+        QUANTITY_TOLERANCE,
+        include_amount_boundary_as_equal=include_amount_boundary,
+    )
     out = map_aqpp_to_legacy(out)
 
-    legacy = assign_scenario_oms(out) if channel.upper() == 'OMS' else assign_scenario_dms(out)
+    # AQPP与FY25在DMS的0.02边界口径不同：AQPP按金额一致；FY25仍按金额尾差。
+    # 正差表示发票>订单，对应FY25场景8；负差对应场景9。
+    if include_amount_boundary:
+        boundary = out['尾差0.02'].eq('是') & out['AQPP可分类'].fillna(False)
+        invoice_gt_order = boundary & out['SIV'].gt(out['SOV'])
+        invoice_lt_order = boundary & out['SIV'].lt(out['SOV'])
+        out.loc[invoice_gt_order, '去年场景编码'] = '8'
+        out.loc[invoice_lt_order, '去年场景编码'] = '9'
+        out.loc[invoice_gt_order, '去年场景描述'] = LEGACY_DESCRIPTIONS['8']
+        out.loc[invoice_lt_order, '去年场景描述'] = LEGACY_DESCRIPTIONS['9']
+        out.loc[boundary, 'AQPP到去年场景映射状态'] = 'DMS尾差按FY25金额差异展示'
+
+    legacy = (
+        assign_scenario_oms(out)
+        if not is_dms
+        else assign_scenario_dms(out)
+    )
     out['去年原始判断编码'] = legacy['场景标号'].astype('string')
     out['去年原始判断描述'] = legacy['场景标号'].map(SCENARIO_DESC).fillna('待确认')
     out['去年原始大类'] = legacy['大类']
@@ -290,4 +341,39 @@ def assign_parallel_scenarios(df: pd.DataFrame, channel: str) -> pd.DataFrame:
     out['场景标号'] = legacy['场景标号']
     out['大类'] = legacy['大类']
     out['细分场景'] = legacy['细分场景']
+    return out
+
+
+def assign_existing_not_test_scenarios(df: pd.DataFrame, channel: str) -> pd.DataFrame:
+    """将不执行普通AQPP的发票按实际三单存在关系归入现有Not Test编码。
+
+    这些发票参与渠道金额完整性核对，但无论订单、发运是否齐全，都不进入
+    AQPP-01至AQPP-24。三单均存在时归入NT-00；其余组合使用NT-28至NT-33。
+    """
+    out = build_three_way_measures(df, channel)
+    if channel.upper() == 'DMS':
+        out['尾差0.02'] = absolute_equal_to_boundary(
+            out['SIV'].sub(out['SOV']), AMOUNT_TOLERANCE
+        ).map({True: '是', False: '否'})
+    codes = classify_not_test_presence(
+        out['存在销售订单'], out['存在发运单'], out['存在销售发票']
+    )
+    out['AQPP场景编码'] = codes
+    out['AQPP场景描述'] = codes.map(NOT_TEST_DESCRIPTIONS)
+    out['AQPP分类'] = 'Not Test'
+    out['AQPP可分类'] = False
+    out['AQPP金额场景编码'] = pd.NA
+    out['AQPP金额场景'] = '待确认'
+    out['AQPP数量场景编码'] = pd.NA
+    out['AQPP数量场景'] = '待确认'
+    out = map_aqpp_to_legacy(out)
+    out['去年原始判断编码'] = '待确认'
+    out['去年原始判断描述'] = '待确认'
+    out['去年原始大类'] = '5.有缺失'
+    out['去年原始细分场景'] = '5.Not test'
+    out['去年映射与原始判断一致'] = False
+    out['场景标号'] = pd.to_numeric(out['去年场景编码'], errors='coerce').fillna(0).astype(int)
+    out['大类'] = '5.有缺失'
+    out['细分场景'] = '5.Not test'
+    out['2.Not test'] = True
     return out
