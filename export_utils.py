@@ -28,6 +28,18 @@ SUMMARY_EXTRA_NT = {
 }
 
 
+# OMS Not Test统一展示标准字段，避免只有“仅发票”记录落在原始列、
+# 其余记录落在聚合列，导致同一Sheet内对金额和数量求和时口径不完整。
+OMS_NOT_TEST_RAW_DUPLICATE_COLUMNS = [
+    '实际金额（ZFN1）',
+    '含税金额',
+    '无税金额',
+    '开票数量（基本单位数量）',
+    'SAP发票号',
+    'SAP发票编号',
+]
+
+
 def add_company_code(df):
     """逐行建立展示用公司代码，而不是为整张表只选一个来源列。"""
     out = df.copy()
@@ -779,9 +791,12 @@ def export_with_classification(df_data, output_file, file_label='',
                 _write_detail_sheets(w, prepared, category, EXCEL_MAX)
 
     # 其他未匹配：Not Test + 仅订单/发货等 outer-join + 特殊发票
+    not_test_drop_cols = list(drop_cols or [])
+    if str(file_label).strip().upper() == 'OMS':
+        not_test_drop_cols.extend(OMS_NOT_TEST_RAW_DUPLICATE_COLUMNS)
     not_test_detail = _prepare_detail_frame(
         build_full_not_test_detail(df_data, extra_categories),
-        drop_cols,
+        not_test_drop_cols,
     )
     unmatched_sheets = []
     if not not_test_detail.empty:

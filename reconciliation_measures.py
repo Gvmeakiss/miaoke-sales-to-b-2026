@@ -13,6 +13,7 @@ from config import (
     ASSUME_BASE_CURRENCY_WHEN_ORDER_MISSING,
     ASSUME_BASIC_QUANTITY_UNIT,
     BASE_CURRENCY,
+    OMS_FINANCE_CONFIRMED_CURRENCY_CONSISTENCY,
 )
 from data_standardization import first_existing_column, normalize_numeric
 
@@ -61,7 +62,7 @@ def _normalized_values(df, columns):
     return values, available
 
 
-def _currency_status(df, columns):
+def _currency_status(df, columns, finance_confirmed_when_missing=False):
     """币种完整时比较三方；源数据缺订单/发运币种时仅对CNY作明确假设。"""
     values, _ = _normalized_values(df, columns)
     if values.empty:
@@ -77,6 +78,9 @@ def _currency_status(df, columns):
         assumed = known_count.gt(0) & ~complete & ~conflict & ~non_base
         status.loc[assumed] = '假定一致-订单发运未提供币种，按CNY'
     status.loc[known_count.gt(0) & ~complete & ~conflict & non_base] = '待确认-非本位币缺少订单发运币种'
+    if finance_confirmed_when_missing:
+        confirmed = known_count.gt(0) & ~complete & ~conflict & non_base
+        status.loc[confirmed] = '财务确认一致-订单发运未提供币种，按发票币种'
     status.loc[conflict] = '不一致'
     return status
 
@@ -118,6 +122,9 @@ def build_three_way_measures(df: pd.DataFrame, channel: str) -> pd.DataFrame:
     out['币种校验状态'] = _currency_status(
         out,
         ('标准-发票币种', '订单币种', '发货币种'),
+        finance_confirmed_when_missing=(
+            channel == 'OMS' and OMS_FINANCE_CONFIRMED_CURRENCY_CONSISTENCY
+        ),
     )
     out['数量单位校验状态'] = _quantity_unit_status(
         out,

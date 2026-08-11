@@ -13,6 +13,8 @@ from export_utils import (
     build_invoice_scope_bridge,
     build_summary_scope,
 )
+from export_schema import apply_export_schema
+from match_oms import add_oms_invoice_display_fields
 
 
 class ExportUtilsTests(unittest.TestCase):
@@ -40,6 +42,61 @@ class ExportUtilsTests(unittest.TestCase):
         self.assertEqual(len(result), 5)
         self.assertEqual(set(result['AQPP场景编码'].dropna()), {'NT-28', 'NT-29', 'NT-30', 'NT-31'})
         self.assertAlmostEqual(pd.to_numeric(result['开票金额'], errors='coerce').sum(), 15.0)
+
+    def test_oms_invalid_key_invoice_uses_same_standard_columns(self):
+        source = pd.DataFrame({
+            '实际金额（ZFN1）': [-120.0],
+            '含税金额': [-118.0],
+            '无税金额': [-105.0],
+            '开票数量（基本单位数量）': [-2.0],
+            'SAP发票号': ['I-001'],
+            '销售组织': [1100],
+            '发票类型': ['ZB02'],
+            '开票记账日期': ['2026-06-30'],
+        })
+        result = add_oms_invoice_display_fields(source)
+        self.assertEqual(result.loc[0, '开票金额'], -120.0)
+        self.assertEqual(result.loc[0, '发票含税金额'], -118.0)
+        self.assertEqual(result.loc[0, '发票不含税金额'], -105.0)
+        self.assertEqual(result.loc[0, '开票数量'], -2.0)
+        self.assertEqual(result.loc[0, '发票-SAP发票号'], 'I-001')
+        self.assertEqual(result.loc[0, '发票-销售组织'], 1100)
+        self.assertEqual(result.loc[0, '发票-发票类型'], 'ZB02')
+        self.assertEqual(result.loc[0, '发票-开票日期'], '2026-06-30')
+
+    def test_oms_standardization_does_not_overwrite_existing_value(self):
+        source = pd.DataFrame({
+            '实际金额（ZFN1）': [100.0, 200.0],
+            '开票金额': [90.0, pd.NA],
+        })
+        result = add_oms_invoice_display_fields(source)
+        self.assertEqual(result['开票金额'].tolist(), [90.0, 200.0])
+
+    def test_export_schema_places_oms_amount_fields_together(self):
+        source = pd.DataFrame({
+            '无关字段': [1],
+            '发票不含税金额': [90.0],
+            '发票含税金额': [113.0],
+            '开票金额': [110.0],
+        })
+        result = apply_export_schema(source)
+        amount_columns = [
+            column for column in result.columns
+            if column in {'开票金额', '发票含税金额', '发票不含税金额'}
+        ]
+        self.assertEqual(amount_columns, ['开票金额', '发票含税金额', '发票不含税金额'])
+
+    def test_export_schema_places_dms_tail_marker_after_amount_difference(self):
+        source = pd.DataFrame({
+            '尾差0.02': ['是'],
+            'SAP-DMS订单金额': [0.02],
+            'SAP开票含税金额': [100.02],
+        })
+        result = apply_export_schema(source)
+        self.assertLess(
+            result.columns.get_loc('SAP-DMS订单金额'),
+            result.columns.get_loc('尾差0.02'),
+        )
 
     def test_overall_summary_separates_channel_share_from_aqpp_scope_share(self):
         source = pd.DataFrame({

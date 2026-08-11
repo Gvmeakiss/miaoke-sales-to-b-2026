@@ -46,6 +46,15 @@ def absolute_greater_than(values, tolerance: float, epsilon: float = FLOAT_BOUND
     return numeric.notna() & numeric.abs().gt(float(tolerance) + float(epsilon))
 
 
+def absolute_equal_to_boundary(values, tolerance: float, epsilon: float = FLOAT_BOUNDARY_EPSILON):
+    """逐项判断绝对值是否恰好落在容差边界；缺失值返回False。"""
+    numeric = pd.to_numeric(values, errors='coerce')
+    return (
+        numeric.notna()
+        & numeric.abs().sub(float(tolerance)).abs().le(float(epsilon))
+    )
+
+
 def scalar_is_zero(value, tolerance: float, epsilon: float = FLOAT_BOUNDARY_EPSILON) -> bool:
     """标量净额是否严格落在零值容差内；缺失值返回False。"""
     numeric = pd.to_numeric(pd.Series([value]), errors='coerce').iloc[0]

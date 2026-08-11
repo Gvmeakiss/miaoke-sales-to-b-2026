@@ -7,6 +7,7 @@ import pandas as pd
 
 from config import AQPP_ALLOWED_CURRENCY_STATUSES, AQPP_ALLOWED_UNIT_STATUSES
 from tolerance_utils import (
+    absolute_equal_to_boundary,
     absolute_greater_than,
     equal_with_tolerance,
     greater_with_tolerance,
@@ -103,13 +104,20 @@ def _equal(a: pd.Series, b: pd.Series, tolerance: float) -> pd.Series:
     return equal_with_tolerance(a, b, tolerance)
 
 
-def classify_value(siv: pd.Series, sov: pd.Series, tolerance: float) -> pd.Series:
-    """判断V1-V3；缺失或恰落在容差边界时返回NA，交由Not Test处理。"""
+def classify_value(
+    siv: pd.Series,
+    sov: pd.Series,
+    tolerance: float,
+    include_boundary_as_equal: bool = False,
+) -> pd.Series:
+    """判断V1-V3；可按渠道配置将金额容差边界纳入V1。"""
     siv = pd.to_numeric(siv, errors='coerce')
     sov = pd.to_numeric(sov, errors='coerce')
     valid = siv.notna() & sov.notna()
     result = pd.Series(pd.NA, index=siv.index, dtype='string')
     result.loc[valid & _equal(siv, sov, tolerance)] = 'V1'
+    if include_boundary_as_equal:
+        result.loc[valid & absolute_equal_to_boundary(siv.sub(sov), tolerance)] = 'V1'
     result.loc[valid & greater_with_tolerance(siv, sov, tolerance)] = 'V2'
     result.loc[valid & greater_with_tolerance(sov, siv, tolerance)] = 'V3'
     return result
@@ -165,10 +173,20 @@ def classify_not_test_presence(has_order, has_delivery, has_invoice) -> pd.Serie
     )
 
 
-def assign_aqpp_scenarios(df: pd.DataFrame, amount_tolerance: float, quantity_tolerance: float) -> pd.DataFrame:
+def assign_aqpp_scenarios(
+    df: pd.DataFrame,
+    amount_tolerance: float,
+    quantity_tolerance: float,
+    include_amount_boundary_as_equal: bool = False,
+) -> pd.DataFrame:
     """按AQPP 24组及Not Test规则分类；返回副本，不修改原DataFrame。"""
     out = df.copy()
-    value_code = classify_value(out['SIV'], out['SOV'], amount_tolerance)
+    value_code = classify_value(
+        out['SIV'],
+        out['SOV'],
+        amount_tolerance,
+        include_boundary_as_equal=include_amount_boundary_as_equal,
+    )
     quantity_code = classify_quantity(out['SIQ'], out['SOQ'], out['GDNQ'], quantity_tolerance)
     has_order = out['存在销售订单'].fillna(False).astype(bool)
     has_delivery = out['存在发运单'].fillna(False).astype(bool)

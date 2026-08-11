@@ -120,18 +120,26 @@ AMOUNT_TOLERANCE = 0.02
 QUANTITY_TOLERANCE = 0.02
 AMOUNT_TAIL_TOLERANCE = 1.0
 
-# 浮点运算保护带。业务边界仍是严格的 ``abs(diff) < tolerance``；
-# 保护带只用于消除 10.02 - 10.00 之类二进制浮点结果略小于 0.02 的误判。
+# DMS业务确认：AQPP金额一致使用abs(diff)<=0.02；数量三方同时一致时归入
+# AQPP-01。OMS仍沿用严格abs(diff)<0.02。FY25兼容汇总仍把=0.02列作金额尾差。
+DMS_AMOUNT_TOLERANCE_INCLUSIVE = True
+
+# 浮点运算保护带。默认业务边界仍是严格的 ``abs(diff) < tolerance``；
+# DMS的±0.02例外由上方单独开关控制。保护带仅消除二进制浮点边界误判。
 FLOAT_BOUNDARY_EPSILON = 1e-9
 
 # 2026H1订单及发运源未提供币种/数量单位字段。只有发票币种为本位币时，
 # 才允许在明确假设下进入AQPP；非本位币必须取得订单/发运币种后再判断。
 BASE_CURRENCY = 'CNY'
 ASSUME_BASE_CURRENCY_WHEN_ORDER_MISSING = True
+# 财务已确认OMS订单、发运与发票的货币种类一致。OMS源缺订单/发运币种时，
+# 允许沿用发票币种（包括USD）进入AQPP；该确认不外推到DMS。
+OMS_FINANCE_CONFIRMED_CURRENCY_CONSISTENCY = True
 ASSUME_BASIC_QUANTITY_UNIT = True
 AQPP_ALLOWED_CURRENCY_STATUSES = {
     '一致',
     '假定一致-订单发运未提供币种，按CNY',
+    '财务确认一致-订单发运未提供币种，按发票币种',
 }
 AQPP_ALLOWED_UNIT_STATUSES = {
     '一致',
