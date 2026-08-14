@@ -1,63 +1,78 @@
-# 2026H1 销售 toB 三单匹配
+# 销售三单匹配（Miaoke · 2026H1 toB） 🔍
 
-> 生产版本：2026 年 1–6 月｜最后整理：2026-07-28  
-> 正式入口：`launch_all.py`｜核心分类：AQPP 无交货金额模式｜渠道：OMS、DMS
+> 对 Miaoke 2026 年 1–6 月 toB 销售订单、发运单与 SAP 发票执行三单匹配，按 OMS / DMS 渠道分别输出总体汇总、公司汇总、AQPP 差异场景、冲销明细与未匹配明细的审计工具。
 
-## 1. 项目概览
+[![Language](https://img.shields.io/badge/language-Python-blue)](https://github.com/Gvmeakiss/miaoke-sales-to-b-2026) [![License](https://img.shields.io/badge/license-MIT-green)](https://github.com/Gvmeakiss/miaoke-sales-to-b-2026/blob/main/LICENSE) [![Domain](https://img.shields.io/badge/domain-Audit%20Analytics-orange)](https://github.com/Gvmeakiss/miaoke-sales-to-b-2026)
 
-本项目对客户提供的销售订单、发运单和 SAP 发票执行三单匹配，分别输出 OMS 与 DMS 的总体汇总、公司汇总、场景汇总、匹配明细和未匹配明细。
+## 📌 项目简介
 
-今年的主要业务口径如下：
+本仓库对 Miaoke 2026 年 1–6 月 toB 销售三单执行匹配，是 2026H1 生产版本（AQPP 无交货金额模式）。订单/发运取数区间 `2025-12-01` 至 `2026-06-30`，发票期间 `2026-01-01` 至 `2026-06-30`。核心分类为 24 子组 `AQPP-01~24`（金额 `V1–V3` × 数量 `Q1–Q8`），FY25 场景作为兼容与同比字段保留。与 2026H1 妙可仓库相比，本仓库额外具备**冲销前置配对**、**币种/数量单位准入**、**PBC 业务范围拆分**与**OMS 匹配能力诊断**，并配有一组**小样本单元测试**。OMS 与 DMS 先按渠道字段互斥切分再分别匹配。
 
-- 客户提供的数据范围即全量范围，不剔除公司代码 1240、1250、1260；
-- OMS 与 DMS 先按渠道字段互斥切分，再分别匹配，避免重复统计；
-- AQPP 使用“无交货金额模式”：金额比较发票与订单，数量比较发票、订单与发运；
-- AQPP 24 组为主分类，FY25 场景作为兼容和同比字段保留；
-- 发票类型统一由 `config.py` 管理，未参与类型保留在类型汇总和特殊发票明细中；
-- 取消/冲销发票在 AQPP 前按 SAP 原发票引用配对；全额冲销、部分冲销和跨期冲销分别处理；
-- 不含税金额只用于补充勾稽，不参与 AQPP 金额判断。
+## ✨ 功能特性
 
-### 1.1 当前项目状态
+- **双渠道互斥匹配**：`match_oms.py` / `match_dms.py` 按 `platform_order_no` / `external_order_no` / `DMS销售单号` 是否非空切分；主聚合键为「订单号 + 物料号」（OMS 组合键用固定分隔符 `||`）。
+- **AQPP 无交货金额模式**：`aqpp_scenarios.classify_value` / `classify_quantity` / `assign_aqpp_scenarios` 交叉得到 `AQPP-01~24`；`map_aqpp_to_legacy` 反向映射 FY25 场景。
+- **not test 单据存在性编码**：`aqpp_scenarios._not_test_code` 产出 `NT-00`、`NT-28` 至 `NT-33`。
+- **冲销前置处理**：`cancellation_preprocessing.preprocess_cancellations` 按 SAP 原发票引用配对（`config.CANCELLATION_ORIGINAL_TYPE_MAP`），区分全额/部分/跨期/待确认冲销（CA-01~CA-06），仅安全的部分冲销按剩余净额进入 AQPP；`aggregate_cancellation_registry` 汇总已冲销业务键。
+- **严格容差与浮点保护**：`tolerance_utils` 是唯一判断实现——`equal_with_tolerance` / `greater_with_tolerance` / `absolute_less_than` / `scalar_is_zero`，以 `FLOAT_BOUNDARY_EPSILON = 1e-9` 消除 `10.02-10.00` 类二进制误差；恰落 `±0.02` 边界的关系不唯—分类，进入 `NT-00`。
+- **币种/单位准入**：`config.BASE_CURRENCY='CNY'`、`ASSUME_BASE_CURRENCY_WHEN_ORDER_MISSING`、`ASSUME_BASIC_QUANTITY_UNIT`、`AQPP_ALLOWED_CURRENCY_STATUSES`/`AQPP_ALLOWED_UNIT_STATUSES` 集中管理订单/发运缺币种、单位时的明确准入假设。
+- **发票类型政策集中管理**：`config.INVOICE_TYPE_RULES`（ZA01 标准、ZA03/04/05 贸易类正常参与、ZA07/ZB01 特殊场景参与、ZB02 退货、ZB05/06 借贷项、ZQ01–ZQ10 冲销配对等），未知类型默认待确认。
+- **PBC 业务范围拆分**：`split_invoice_by_scope_and_type.classify_invoice_scope` 按 `config.PBC_INVOICE_SCOPE_TYPES` 将原始发票归入 ToB-DMS / ToB-OMS / To C / 其他，仅复现匹配前渠道归属，不应用 AQPP 政策或冲销净额化。
+- **OMS 匹配能力诊断**：`invoice_matchability.build_oms_invoice_type_matchability` 输出各发票类型的匹配键完整性、订单/发运命中与三单齐全率。
+- **FY25 兼容汇总**：`legacy_summary.build_fy25_format_summary` 用 FY25 场景映射生成去年版式汇总并补齐 `NT-00/28~33`。
+- **预处理与校验**：`preprocess_2026.py` 读取 SQL/发票 Excel 生成三份标准化 PKL；`validate_2026.py` 校验字段契约、渠道数据量与单号覆盖；`data_standardization.py` / `pipeline_common.py` 提供共用标准化与字段契约；`archive_release.py` 生成轻量归档、文件清单与 SHA256 校验值。
+- **小样本单元测试**：`test_aqpp_scenarios.py`、`test_cancellation_preprocessing.py`、`test_export_utils.py`、`test_invoice_aggregation.py`、`test_invoice_matchability.py`、`test_invoice_scope_split.py`、`test_legacy_summary.py`，覆盖 24 组、±0.02 边界、币种/单位准入、冲销与完整 NT 范围，不读取全量数据。
 
-截至2026-07-28，2026H1全量预处理和OMS/DMS匹配均已完成，六份正式结果已生成；
-原始发票已按类型以及PBC业务范围完成两套拆分。当前版本可供项目组和Audit复核，
-但跨期Not Test、客户IT缺失单据原因、ZA05最终AQPP范围及订单/发运币种和数量单位仍待确认。
-管理层进度摘要见项目根目录`项目进度_2026H1.md`。
+## 📂 目录结构
 
-### 1.2 当前数据期间
+```
+miaoke-sales-to-b-2026/
+├── README.md
+├── config.py                     # 路径、期间、ORDER_STATUS_EXCLUDE、INVOICE_TYPE_RULES、
+│                                 #   PBC_INVOICE_SCOPE_TYPES、CANCELLATION_ORIGINAL_TYPE_MAP、
+│                                 #   AMOUNT/QUANTITY_TOLERANCE、FLOAT_BOUNDARY_EPSILON、币种/单位准入
+├── launch_all.py                 # 一键预处理 + OMS/DMS 匹配（--rebuild / --preprocess-only）
+├── preprocess_2026.py            # 读取 SQL/发票 Excel → 三份标准化 PKL
+├── validate_2026.py              # 校验 PKL 字段、渠道数据量、单号覆盖
+├── data_standardization.py       # 单号/数值/币种/数量单位标准化
+├── tolerance_utils.py            # 严格容差与浮点保护带唯一实现
+├── pipeline_common.py            # OMS/DMS 共用读取、字段契约、状态与年度筛选
+├── invoice_type_policy.py        # 识别发票类型并判断是否参与匹配
+├── invoice_matchability.py       # OMS 各发票类型匹配能力诊断
+├── cancellation_preprocessing.py # 冲销配对、剩余净额与已冲销业务键注册
+├── match_oms.py                  # OMS 匹配、聚合、分类与导出
+├── match_dms.py                  # DMS 匹配、聚合、分类与导出
+├── reconciliation_measures.py    # build_three_way_measures 统一 SIV/SOV/SIQ/SOQ/GDNQ 口径
+├── aqpp_scenarios.py             # AQPP-01~24、NT 分类与 FY25 映射
+├── scenario_utils.py             # FY25 原逻辑及新旧场景并行校验
+├── legacy_summary.py             # FY25 版式兼容汇总（build_fy25_format_summary）
+├── export_utils.py               # 汇总、公司、分场景与未匹配输出
+├── export_schema.py              # 审计字段顺序、中文字段名与冗余字段隐藏
+├── export_order_delivery_excel.py# 订单/发运 PKL → Excel，超行分卷
+├── split_invoice_by_type.py      # 原始发票 PKL 按类型拆分 Excel
+├── split_invoice_by_scope_and_type.py # 按 PBC 范围 + 类型拆分并生成核对表
+├── archive_release.py            # 生成轻量归档、清单与 SHA256
+├── requirements.txt              # pandas>=3.0 / numpy>=2.0 / openpyxl>=3.1 / XlsxWriter>=3.2
+├── test_*.py                     # 小样本单元测试（见功能特性）
+└── LICENSE
+```
 
-| 项目 | 当前设置 |
-|---|---|
-| 订单、发运取数区间 | 2025-12-01 至 2026-06-30 |
-| 发票期间 | 2026-01-01 至 2026-06-30 |
-| 目标年度 | 2026 |
-| 输出目录 | `output/2026H1/` |
-| PKL 目录 | `pkl/2026H1/` |
+## 🔧 环境要求
 
-### 1.3 推荐阅读顺序
+- Python 3.11+（README 建议；PKL 由 pandas 3.x 生成，归档环境须 `pandas>=3.0` 以免旧版无法反序列化字符串类型）
+- 依赖见 `requirements.txt`：`pandas>=3.0`、`numpy>=2.0`、`openpyxl>=3.1`、`XlsxWriter>=3.2`
 
-1. 本 README 的“业务口径与勾稽关系”；
-2. `config.py`：路径、期间、容差、发票类型政策；
-3. `match_oms.py` / `match_dms.py`：渠道匹配流程；
-4. `aqpp_scenarios.py`：AQPP 分类；
-5. `export_utils.py` / `export_schema.py`：汇总和明细输出。
-
----
-
-## 2. 快速开始
-
-### 2.1 环境安装
-
-建议使用 Python 3.11 或更高版本：
+## 🚀 安装
 
 ```bash
-cd "code 2026"
+git clone https://github.com/Gvmeakiss/miaoke-sales-to-b-2026.git
+cd miaoke-sales-to-b-2026
 python3 -m pip install -r requirements.txt
 ```
 
-依赖包括：`pandas`、`numpy`、`openpyxl`、`XlsxWriter`。当前 PKL 由 pandas 3.x 生成，归档环境应按 `requirements.txt` 安装 pandas 3.0 或更高版本，避免旧版 pandas 无法反序列化字符串类型。
+## 💡 快速开始 / 使用示例
 
-### 2.2 常用命令
+生产入口为 `launch_all.py`：
 
 ```bash
 # 复用已有 PKL，执行 OMS + DMS 匹配
@@ -69,484 +84,81 @@ python3 launch_all.py --rebuild
 # 只做预处理，不执行匹配
 python3 launch_all.py --preprocess-only
 
-# 单独校验 PKL
+# 单独校验 PKL、单独跑渠道匹配
 python3 validate_2026.py
-
-# 运行全部小样本单元测试，不读取全量数据、不生成Excel
-python3 -m unittest discover -p 'test_*.py' -v
-
-# 单独执行渠道匹配
 python3 match_oms.py
 python3 match_dms.py
-```
 
-### 2.3 是否需要清理旧结果
+# 运行全部小样本单元测试（不读取全量数据、不生成 Excel）
+python3 -m unittest discover -p 'test_*.py' -v
 
-不需要手工删除正式结果。匹配脚本会覆盖同名 Excel；PKL 默认复用，只有 `--rebuild` 或 `preprocess_2026.py --force` 才重建。
-
-以下情况必须使用 `--rebuild`：
-
-- 更新了订单、发运或发票原始文件；
-- 修改了预处理字段映射、数据类型或标准化规则；
-- PKL 与当前代码版本不一致。
-
-只修改场景、发票类型、汇总或显示格式时，可直接重跑 `match_oms.py` / `match_dms.py`。
-
----
-
-## 3. 项目目录与文件职责
-
-```text
-miaoke sales to b/
-├── README.md                         # 项目导航
-├── input/                            # 原始输入，只读
-├── pkl/2026H1/                       # 标准化中间数据
-├── output/2026H1/                    # 正式结果
-├── archive/2026H1/                   # 代码归档与文件清单
-├── code 2026/                        # 当前生产代码
-├── code 2025/                        # 去年代码，仅供对照
-├── 参考 code 2026/                   # 外部项目参考，不是生产入口
-├── AQPP 三单匹配场景规范_full.xlsx
-└── 2026H1销售三单匹配口径说明.txt
-```
-
-### 3.1 生产代码模块
-
-| 文件 | 职责 |
-|---|---|
-| `config.py` | 路径、期间、状态剔除、发票类型政策、金额和数量容差 |
-| `launch_all.py` | 一键执行预处理、OMS 匹配、DMS 匹配 |
-| `preprocess_2026.py` | 读取 SQL 与月度发票 Excel，生成三份标准化 PKL |
-| `validate_2026.py` | 校验 PKL 必需字段、渠道数据量及关键单号覆盖 |
-| `data_standardization.py` | 单号、数值、币种和数量单位标准化 |
-| `tolerance_utils.py` | 金额/数量严格容差与浮点边界保护的唯一实现 |
-| `pipeline_common.py` | OMS/DMS 共用读取、字段契约、状态和年度筛选 |
-| `invoice_type_policy.py` | 识别发票类型并判断是否参与匹配 |
-| `invoice_matchability.py` | 按发票类型诊断OMS匹配键、订单及发运覆盖，不改变业务政策 |
-| `cancellation_preprocessing.py` | AQPP 前冲销配对、净额判断及已冲销业务键注册 |
-| `match_oms.py` | OMS 匹配、聚合、分类与导出 |
-| `match_dms.py` | DMS 匹配、聚合、分类与导出 |
-| `reconciliation_measures.py` | 统一生成 SIV/SOV/SIQ/SOQ/GDNQ 口径 |
-| `aqpp_scenarios.py` | AQPP-01~24、NT 分类及 FY25 映射 |
-| `scenario_utils.py` | FY25 原逻辑及新旧场景并行校验 |
-| `export_utils.py` | 汇总、分公司、分场景及未匹配输出 |
-| `legacy_summary.py` | 使用FY25场景映射生成去年版式兼容汇总，并补齐NT-00/28~33 |
-| `export_schema.py` | 财务审计顺序、中文字段名及冗余字段隐藏 |
-| `export_order_delivery_excel.py` | 将订单/发运 PKL 导出为 Excel，超行数自动分卷 |
-| `split_invoice_by_type.py` | 将原始发票 PKL 按发票类型导出 Excel，超行数自动分卷 |
-| `split_invoice_by_scope_and_type.py` | 按匹配前PBC范围（DMS/OMS/To C/其他）及发票类型拆分，生成完整性核对表 |
-| `archive_release.py` | 生成轻量版本归档、项目文件清单、SHA256校验值及ZIP包 |
-
----
-
-## 4. 端到端执行逻辑
-
-```text
-原始订单 SQL ─┐
-原始发运 SQL ─┼─> preprocess_2026.py ─> 标准化 PKL ─> validate_2026.py
-月度发票 Excel ┘                                  │
-                                                   ├─> match_oms.py
-                                                   │    ├─渠道切分
-                                                   │    ├─发票类型治理
-                                                   │    ├─冲销配对与剩余净额
-                                                   │    ├─三单聚合与连接
-                                                   │    ├─AQPP + FY25 分类
-                                                   │    └─三套结果
-                                                   └─> match_dms.py（同上）
-```
-
-匹配阶段按以下顺序处理：
-
-1. 读取标准化 PKL，并检查字段契约；
-2. 按 OMS/DMS 渠道互斥切分订单、发运和发票；
-3. 剔除状态为 `OBSOLETE`、`CANCEL` 的订单；
-4. 应用发票类型政策；
-5. 按 SAP 冲销原发票号执行冲销配对，识别全额、部分、跨期及待确认冲销；
-6. 标准化匹配键并按键聚合冲销后的剩余金额、数量和业务字段；
-7. 以可参与匹配的发票聚合结果为主表，连接发运和订单；
-8. 使用已冲销业务键分流订单/发运，防止其重新进入 Not Test；
-9. 生成统一口径，判断三单完整性；
-10. 计算 AQPP 场景，并映射 FY25 场景；
-11. 输出汇总、AQPP 匹配明细、冲销明细和其他未匹配明细。
-
----
-
-## 5. OMS 与 DMS 的区别及匹配字段
-
-### 5.1 渠道切分
-
-| 对象 | DMS | OMS |
-|---|---|---|
-| 订单 | `platform_order_no` 非空 | `platform_order_no` 为空 |
-| 发运 | `external_order_no` 非空 | `external_order_no` 为空 |
-| 发票 | `DMS销售单号` 非空 | `DMS销售单号` 为空 |
-
-DMS 发票可能同时存在 OMS 销售单号。渠道归属只以 `DMS销售单号` 是否非空判断，确保同一发票不会同时进入两个渠道。
-
-这里的OMS是匹配程序的“技术OMS渠道”，即所有`DMS销售单号`为空的发票。用于Audit完整性核对的
-PBC业务范围会将技术OMS进一步按发票类型拆为ToB-OMS、To C和其他；AQPP正式输入还会继续应用
-发票类型政策、冲销处理和关键键检查。三层范围不得混用。
-
-### 5.2 匹配键
-
-| 渠道 | 订单 | 发运 | 发票 |
-|---|---|---|---|
-| DMS | `platform_order_no + item_code` | `external_order_no + 料号` | `DMS销售单号 + 物料编码` |
-| OMS | `(main_order_no，缺失回退 sale_order_no) + item_code` | `(主单号/main_order_no，缺失回退订单号) + 料号` | `OMS销售单号 + 物料编码` |
-
-OMS 组合键使用固定分隔符 `||`。订单号或物料号任一缺失时不生成键，避免空值误拼接和键碰撞。
-
-辅助核对关系：发运 `document_no` 对应发票 `OMS出库单号`，由 `validate_2026.py` 检查覆盖情况，但主聚合仍以订单号 + 物料号为核心键。
-
-### 5.3 金额与数量口径
-
-| AQPP口径 | OMS | DMS | 聚合 |
-|---|---|---|---|
-| SOV 订单金额 | `pay_amount` | `pay_amount` | sum |
-| SOQ 订单数量 | `item_num` | `item_num` | sum |
-| GDNQ 发运数量 | `已发货数量` | `已发货数量` | sum |
-| SIV 发票金额 | `实际金额（ZFN1）` | `含税金额` | sum |
-| SIQ 发票数量 | `开票数量（基本单位数量）` | 同左 | sum |
-| 发票不含税金额 | `无税金额` | `无税金额` | sum，仅展示 |
-
-关键提示：OMS 主金额不是 `含税金额`，而是 `实际金额（ZFN1）`；DMS 主金额使用 `含税金额`。两渠道同一发票类型金额不同，通常来自渠道切分和金额字段口径不同，并不表示发票未读取。
-
----
-
-## 6. 范围、剔除和发票类型政策
-
-### 6.1 全量公司范围
-
-- 不剔除公司代码 1240、1250、1260；
-- 不生成三家公司的单独剔除结果；
-- 公司代码缺失时归入“公司代码缺失”，不删除；
-- 汇总、场景分类和明细均保留范围内数据。
-
-### 6.2 订单状态
-
-`ORDER_STATUS_EXCLUDE = ['OBSOLETE', 'CANCEL']`。除该状态规则、渠道互斥和目标年度附属筛选外，不存在公司黑名单。
-
-### 6.3 发票类型
-
-| 类型 | 含义 | 当前处理 |
-|---|---|---|
-| ZA01 | 标准发票（2B） | 正常参与匹配 |
-| ZA03 / ZA04 / ZA05 | 现货、期货、代拍贸易发票 | 正常参与匹配 |
-| ZA07 / ZB01 | 工厂成品销售、物流赔偿 | 参与同一套 AQPP，同时进入特殊明细便于复核 |
-| ZA02 / ZA06 | 2C、行政/工厂 | 不参与普通 AQPP，保留待确认/特殊业务明细 |
-| ZB02 | 标准退货 | 未被ZQ07冲销的部分不参与普通AQPP，保留退货待确认明细 |
-| ZB05 / ZB06 | 借项、贷项 | 不参与普通 AQPP，保留金额调整明细 |
-| ZQ01 / ZQ03 / ZQ06 / ZQ07 / ZQ09 / ZQ10 | 取消/冲销类 | 先与原发票配对；全额冲销不进入AQPP，安全的部分冲销按剩余净额进入 |
-| 未识别类型 | 未配置 | 不参与匹配，保留待确认明细 |
-
-“正常参与”和“特殊业务参与”使用完全相同的 AQPP 公式。区别只是特殊业务会额外进入特殊发票明细，便于审计复核，不代表另一套场景算法。
-
-ZA05当前在AQPP政策中为正常参与，但在PBC业务完整性拆分中归入“其他”。前者回答是否进入AQPP，
-后者回答原始PBC如何向Audit分组，两者不是同一维度。是否将ZA05最终排除出AQPP仍需财务确认，
-不能通过修改拆分文件夹静默改变匹配政策。
-
-金额正负号沿用 SAP 原始清单。在缺少可靠借贷标识和冲销配对结论时，不自动翻转退货、贷项或冲销金额。
-
-### 6.4 冲销前置处理
-
-冲销关系优先使用 `SAP冲销发票号 → SAP发票号`，类型关系由
-`CANCELLATION_ORIGINAL_TYPE_MAP` 集中配置。不得仅凭金额相反或订单号相同自动配对。
-当前ZQ01允许冲销ZA01或ZA07，后者来自2026H1一组具有明确SAP引用且金额、数量均归零的实际记录。
-
-| 编码 | 处理 | AQPP口径 |
-|---|---|---|
-| CA-01 | 同期全额冲销，金额和基本数量在0.02容差内净额为零 | 原发票与取消发票均不进入普通AQPP |
-| CA-02 | 原发票未在本期清单，通常为跨期冲销 | 待补历史原发票，不进入AQPP |
-| CA-03 | 同期部分冲销，且订单物料键一致 | 原发票与取消发票共同聚合，按剩余净额进入AQPP |
-| CA-04 | 部分冲销、币种或订单物料键不一致 | 不自动净额，进入待确认 |
-| CA-05 | 取消发票缺少原发票号 | 不进入AQPP，进入待确认 |
-| CA-06 | 原发票类型与取消类型映射不一致 | 不进入AQPP，进入待确认 |
-
-已识别冲销业务同步生成订单物料注册表。若冲销后没有剩余有效发票，相关订单、发运不会重新落入
-“仅订单及发运单”，而是进入“已冲销净额0”或“冲销业务待确认”。冲销记录不计作“完全匹配”。
-
----
-
-## 7. AQPP 分类与容差
-
-### 7.1 适用条件
-
-记录进入 AQPP-01~24 必须同时满足：
-
-- 存在订单、发运和发票；
-- SIQ、SOQ、GDNQ 均可取数；
-- SIV、SOV 均可取数；
-- 币种、数量单位及容差边界不导致关系无法唯一判断。
-
-不满足时进入 Not Test。
-
-### 7.2 无交货金额模式
-
-- 金额：V1 `SIV=SOV`、V2 `SIV>SOV`、V3 `SIV<SOV`；
-- 数量：Q1~Q8，比较 SIQ、SOQ、GDNQ；
-- 编号：`(V序号 - 1) × 8 + Q序号`，形成 AQPP-01~24。
-
-AQPP-01 为完全匹配；Q1 且金额不等为金额差异；V1 且数量不等为数量差异；其余为数量+金额差异。
-
-### 7.3 Not Test
-
-| 编码 | 含义 |
-|---|---|
-| NT-00 | 关键字段缺失或关系无法判断 |
-| NT-28 | 仅订单 |
-| NT-29 | 仅发运单 |
-| NT-30 | 仅开票 |
-| NT-31 | 仅订单及发运单 |
-| NT-32 | 订单及开票，无发运单 |
-| NT-33 | 发运单及开票，无订单 |
-
-### 7.4 容差
-
-| 配置 | 当前值 | 判断 |
-|---|---:|---|
-| 金额容差 | 0.02 | `abs(a-b) < 0.02` |
-| 数量容差 | 0.02 | `abs(a-b) < 0.02` |
-| FY25 尾差阈值 | 1.00 | 去年“尾差<1”细分 |
-
-所有容差集中在 `config.py`，主流程不得直接用浮点数 `a == b`。代码通过
-`tolerance_utils.py`执行判断，并使用`1e-9`浮点保护带；因此十进制计算得到的
-`10.02-10.00`不会被误判为小于0.02。恰落在±0.02边界的关系不能唯一分类，进入NT-00。
-
-### 7.5 币种及数量单位准入
-
-2026H1订单及发运清单未提供币种、数量单位字段，发票清单提供这两项：
-
-- 发票币种为CNY时，按配置明确标记“假定一致-订单发运未提供币种，按CNY”，可以进入AQPP；
-- 发票币种为USD等非本位币时，标记“待确认-非本位币缺少订单发运币种”，进入NT-00；
-- 三方数量都使用已标准化的基本数量字段时，标记“假定一致-三方数量字段按基本单位”；
-- 如果后续取得订单/发运币种或单位，三方值有冲突时直接标记“不一致”，不得进入AQPP。
-
-上述假设由`BASE_CURRENCY`、`ASSUME_BASE_CURRENCY_WHEN_ORDER_MISSING`、
-`ASSUME_BASIC_QUANTITY_UNIT`及AQPP准入状态白名单集中管理。
-
----
-
-## 8. 发票金额勾稽与占比口径
-
-### 8.1 三层金额范围
-
-1. **原始发票清单金额**：渠道切分后的全部发票类型净额；
-2. **参与匹配发票金额**：只含发票类型政策允许进入 AQPP 的发票；
-3. **AQPP/Not Test 金额**：参与匹配发票按聚合键进入分类后的金额。
-
-因此，原始发票类型汇总与三单匹配总金额不一定相等。差异应能由“不参与匹配的发票类型”“关键匹配键缺失”或聚合口径解释，不应被静默丢弃。
-
-“渠道发票清单”统计不再混用粒度：清单行数、SAP发票数、订单物料匹配键数分别披露；
-其金额为冲销前置处理后政策允许参与匹配的发票净额，并包含因关键匹配键缺失而进入NT-30的发票。
-
-### 8.2 发票金额占比
-
-| 页面 | 分子 | 分母 |
-|---|---|---|
-| 总体/AQPP 场景汇总 | 该分类参与匹配发票金额 | 渠道可参与匹配发票净额 |
-| 发票类型汇总 | 该类型原始发票金额 | 渠道全部原始发票净额 |
-
-记录数占比与金额占比分母不同。不能用全部发票金额作为 AQPP 参与范围的分母，也不能把 OMS、DMS 两个渠道金额相加后作为单渠道分母。
-
-### 8.3 不含税金额
-
-汇总和勾稽页面补充 `发票不含税金额`。该字段来自原始发票 `无税金额`，仅用于税额及净额复核；AQPP 金额判断继续使用 OMS 的 ZFN1 或 DMS 含税金额。
-
----
-
-## 9. 输出文件和 Sheet 结构
-
-OMS 与 DMS 各输出三份文件：
-
-### 9.1 `…汇总.xlsx`
-
-| Sheet | 内容 |
-|---|---|
-| `汇总` | 总体汇总、各公司汇总、各公司场景分布 |
-| `AQPP场景汇总` | AQPP-01~24、NT-00/28~33、FY25 映射、金额数量及占比 |
-| `去年格式汇总` | 按FY25的1~5类及小分类展示；主类使用去年场景映射，Not Test完整列示NT-00/28~33 |
-| `发票类型汇总` | 原始发票类型一类一行展示数量、含税/匹配口径金额、不含税金额及参与状态；同类型存在冲销前置剔除时显示“部分” |
-| `OMS类型匹配能力` | OMS各发票类型的匹配键完整性、订单命中、发运命中、三单齐全率及处理结论（仅OMS文件） |
-| `PBC-AQPP桥接` | 原始PBC→政策允许→匹配键完整的正式聚合输入，并单列关键键缺失、政策/冲销排除及校验差额 |
-| `冲销处理汇总` | CA-01~CA-06配对组数、原/取消发票数、行数和净额 |
-
-`去年格式汇总`只作为兼容展示，不替代AQPP主口径：
-
-- 1~4类以`去年场景编码`汇总，2.1/2.2及4.1~4.5按当前集中容差重新细分；
-- `1.1 尾差≤0.01`是完全匹配父类中的非零容差尾差子集，不在小计中重复加总；
-- Not Test完整展示NT-00、NT-28~NT-33。NT-30/32/33来自发票驱动匹配结果，NT-28/29/31来自订单与发运外连接结果；
-- `汇总`、`各公司汇总`、`各公司场景分布`和`AQPP场景汇总`均补入NT-28/29/31及关键键缺失的NT-30，公司代码无法取得时归入“公司代码缺失”；
-- 记录数总计=`AQPP小计+Not Test`，子类只作穿透披露，不重复计入总计；
-- 发票金额占比继续使用对应渠道AQPP输入发票净额作为分母；差异占比使用AQPP小计发票金额作为分母。
-
-### 9.2 `…明细.xlsx`
-
-按 AQPP 大类拆成独立 Sheet：`完全匹配`、`金额差异`、`数量差异`、`数量+金额差异`；只生成实际有数据的 Sheet。Sheet 名已表达场景分类，因此明细不重复展示“场景分类”字段。
-
-### 9.3 `…明细-其他未匹配.xlsx`
-
-按实际数据输出：`Not Test`、`仅订单`、`仅发货单`、`仅订单及发货单`、`仅发票`、
-`已冲销净额0`、`冲销业务待确认`、`特殊发票明细`、`冲销配对明细`。
-
-### 9.4 明细字段顺序
-
-财务审计阅读顺序为：公司与场景结论 → 三单单号及日期 → 客户/物料 → 金额及差异 → 数量及差异 → 完整性与其他业务字段。
-
-以下重复或诊断字段不对外展示：场景分类、去年场景编码、发货金额口径、金额场景、数量场景，以及 AQPP/FY25 交叉验证中间字段。
-
----
-
-## 10. 原始清单导出与发票类型拆分
-
-```bash
-# 订单、发运 PKL 转 Excel；默认每卷最多 1,000,000 行
-python3 export_order_delivery_excel.py
+# 原始清单导出与发票拆分
 python3 export_order_delivery_excel.py --max-rows 1000000
-
-# 发票 PKL 按发票类型导出；Excel 上限内每种类型一个文件
 python3 split_invoice_by_type.py
-
-# 发票按匹配前PBC范围→发票类型拆分，并生成范围金额核对表
 python3 split_invoice_by_scope_and_type.py
-```
 
-发票拆分输出目录：`output/2026H1/原始发票清单按类型拆分/`。每个文件保留全部原始字段，超过 1,048,575 条数据行时自动生成“第1卷、第2卷……”文件，并生成 `拆分文件清单.csv`。
-
-按匹配范围拆分输出目录：`output/2026H1/发票清单按匹配范围及类型拆分/`，结构为：
-
-```text
-发票清单按匹配范围及类型拆分/
-├── 01_ToB-DMS匹配范围/       # DMS销售单号非空，渠道优先级最高
-├── 02_ToB-OMS匹配范围/       # DMS销售单号为空，且属于OMS原始PBC类型范围
-├── 03_ToC非三单范围/         # DMS销售单号为空且类型为ZA02
-├── 04_其他非三单范围/        # 其他业务及未配置类型
-├── 拆分清单及口径核对.xlsx
-├── 范围汇总.csv
-└── 类型文件清单.csv
-```
-
-该拆分仅复现匹配前的原始PBC渠道归属，不应用AQPP发票类型政策，不执行冲销配对或净额化，
-也不因OMS销售单号/物料号缺失而改放其他目录。因此冲销发票和OMS关键键缺失发票仍留在
-其原渠道文件夹，四类目录合计应与原始SAP发票清单的行数、含税金额、不含税金额及ZFN1金额一致。
-其中DMS按`DMS销售单号非空`优先归属；DMS销售单号为空时，OMS类型范围为
-`ZA04、ZA01、ZA03、ZA06、ZA07、ZQ10、ZB02、ZB01、ZQ07、ZQ01、ZQ06、ZQ03`，
-To C为`ZA02`，其他为`ZB05、ZB06、ZA05、ZQ09`。上述范围配置集中维护在`config.py`的
-`PBC_INVOICE_SCOPE_TYPES`中，与最终是否进入AQPP是两个不同维度。
-
-大宽表使用 XlsxWriter 恒定内存写入和 ZIP64 封装；不要改回一次性内存工作簿，否则可能因数千万单元格耗尽内存。
-
----
-
-## 11. 配置维护
-
-修改期间或文件名时，优先更新 `config.py`：
-
-| 配置 | 含义 |
-|---|---|
-| `ORDER_SQL` / `DELIVERY_SQL` / `INVOICE_DIR` | 原始输入路径 |
-| `OUTPUT_PREFIX` | 输出文件名前缀 |
-| `TARGET_YEAR` | 附属未匹配集合的目标年度 |
-| `*_PKL` | 标准化 PKL 路径 |
-| `ORDER_STATUS_EXCLUDE` | 订单状态剔除 |
-| `INVOICE_TYPE_RULES` | 发票类型参与政策 |
-| `PBC_INVOICE_SCOPE_TYPES` | 原始PBC业务范围拆分，不控制AQPP参与政策 |
-| `AMOUNT_TOLERANCE` / `QUANTITY_TOLERANCE` | AQPP 容差 |
-| `FLOAT_BOUNDARY_EPSILON` | 十进制容差边界的浮点保护带 |
-| `BASE_CURRENCY`及`ASSUME_*` | 订单/发运缺币种、单位时的明确准入假设 |
-
-新增发票类型时必须同时明确：业务含义、是否参与、是否作为特殊业务展示。未知类型默认进入待确认，不允许自动并入普通销售。
-
----
-
-## 12. 校验、性能与常见问题
-
-### 12.1 静态/数据校验
-
-`validate_2026.py`用于检查：
-
-- 三份 PKL 是否存在及字段是否完整；
-- OMS/DMS 渠道数据量是否异常；
-- OMS 拆单键是否可构造；
-- 发运单号与发票出库单号覆盖情况。
-
-小样本测试覆盖AQPP 24组、±0.02严格边界、币种/单位准入、全额/部分/跨期冲销、
-冲销键完整性、发票类型单行汇总、PBC桥接及完整NT范围；不会读取或生成全量匹配结果。
-
-### 12.2 性能设计
-
-- 预处理只做一次，匹配阶段复用 PKL；
-- 发票先切渠道，再做类型治理，避免宽表重复复制；
-- OMS/DMS 复用公共字段契约和筛选函数；
-- DMS宽表对单行订单物料键使用快速`first`聚合，仅对重复键执行多值文本拼接，既保留发票类型/冲销审计信息，也避免数百万次Python分组调用；
-- AQPP 固定场景汇总一次聚合完成；
-- 超大原始发票导出使用恒定内存模式，适配 M3 Max 36GB。
-
-### 12.3 常见问题
-
-**OMS Not Test 较多是否因为混入 DMS？** 不是。OMS 已排除 `DMS销售单号` 非空发票。OMS Not Test 常见原因是发票存在，但本期订单或发运键无法挂接。
-
-**为什么同一类型 OMS 与 DMS 金额不同？** 两渠道发票范围互斥，且 OMS 使用 ZFN1、DMS 使用含税金额。应分别与各自渠道原始发票范围勾稽。
-
-**为什么三单匹配金额接近标准发票金额？** 只有配置为参与匹配的发票类型进入 AQPP。退货、借贷项和冲销类当前保留在特殊明细，不并入普通销售匹配。
-
-**贸易类能否匹配？** ZA03、ZA04、ZA05 已配置为正常参与。是否匹配成功仍取决于订单号、物料号和发运数据是否存在。
-
-**哪些发票类型在OMS无法匹配？** 查看OMS汇总文件的`OMS类型匹配能力`。该页将“政策上不进入AQPP”与“有OMS匹配键但本期订单/发运未命中”分开显示；本期无法命中不自动变成永久类型黑名单。冲销类型即使订单、发运键可命中，也仍按CA-01~CA-06前置规则处理。
-
-**参考代码能否直接运行？** 不能。`code 2025` 和 `参考 code 2026` 仅用于对照，生产运行只使用本目录。
-
----
-
-## 13. 2026H1 当前结果参考
-
-预处理记录数：订单 825,356；发运 648,194；发票 615,343。该数字用于异常检查，不作为未来期间的硬编码阈值。
-
-发票原始清单包含 17 种类型；按类型拆分后共 17 个 Excel，合计 615,343 行、107 个原始字段，已与发票 PKL 对账一致。
-
-按匹配前PBC范围及类型拆分后共21个明细Excel：ToB-DMS 4个类型、ToB-OMS 12个类型、
-To C 1个类型、其他4个类型。范围行数分别为548,294、37,748、11,863、17,438，
-合计615,343行；含税金额分别为3,129,945,595.55、349,482,274.18、289,523,056.34、
--19,683,223.29，合计3,749,267,702.78，与原始发票PBC一致。
-
-最新全量匹配已于2026-07-28完成。正式结果快照如下：
-
-| 渠道 | 汇总记录数 | AQPP小计 | Not Test | AQPP输入发票金额 | 完全匹配记录数 | 完全匹配金额 |
-|---|---:|---:|---:|---:|---:|---:|
-| DMS | 536,168 | 500,504 | 35,664 | 3,151,890,431.95 | 499,032 | 3,076,228,781.76 |
-| OMS | 14,604 | 3,031 | 11,573 | 412,988,318.52 | 3,029 | 385,535,981.17 |
-
-OMS类型匹配能力诊断页显示：
-
-| 结论 | 发票类型 | 当前数据表现 |
-|---|---|---|
-| AQPP范围内部分/全部可匹配 | ZA01、ZA03、ZA04、ZA05、ZA07、ZB01 | 均存在订单和发运同时命中的键，没有一种是全量无法匹配；各类型覆盖率以`OMS类型匹配能力`为准 |
-| OMS匹配键全部缺失 | ZA06、ZQ10 | 当前行无法形成“OMS销售单号+物料号”键 |
-| 有OMS键但订单、发运均未命中 | ZA02、ZB02、ZB05、ZB06、ZQ07、ZQ09 | 可能是非toB、跨期或特殊业务范围，不能仅凭本期未命中永久剔除 |
-| 键可命中但先执行冲销处理 | ZQ01、ZQ03、ZQ06 | 不直接作为独立正常发票进入AQPP，先与明确引用的原发票净额化 |
-
-上述“匹配能力”只回答数据键是否能钩稽；“是否进入AQPP”仍以发票类型政策和冲销前置规则为准。总计行的有效键和三单齐全键按跨类型去重，取消发票与原发票共用同一键时不会重复计数。
-
-正式输出位于 `output/2026H1/`。如输入更新或代码重跑，应以最新文件为准，不要引用 README 中的历史金额作为最终审计结论。
-
----
-
-## 14. 归档约定
-
-`archive/2026H1/`只归档生产代码、README、口径说明、AQPP 规范和文件清单，不复制 1GB 级原始输入、PKL 或正式结果。这样既保留可复核版本，也避免产生多个难以辨识的数据副本。
-
-生成当前归档：
-
-```bash
+# 生成轻量归档与文件清单
 python3 archive_release.py --version 2026H1_20260728_v1
 ```
 
-归档目录包含项目文件清单及SHA256，用于锁定未复制的大文件版本；同名版本默认拒绝覆盖，
-只有明确需要重建时才使用`--replace`。
+匹配脚本会覆盖同名 Excel；PKL 默认复用，仅 `--rebuild` 或 `preprocess_2026.py --force` 才重建。
 
-归档后目录职责：
+## 🧠 核心逻辑（方法论）
 
-- `input/`：唯一原始输入；
-- `pkl/2026H1/`：唯一标准化中间数据；
-- `output/2026H1/`：唯一正式输出；
-- `code 2026/`：当前可维护代码；
-- `archive/2026H1/`：冻结代码包、清单与归档说明。
+1. **预处理标准化**：`preprocess_2026.py` 读取订单/发运 SQL 与月度发票 Excel，经 `data_standardization.py` 标准化后写出三份 PKL（`config.ORDER_PKL` / `DELIVERY_PKL` / `INVOICE_PKL`）；`validate_2026.py` 校验必需字段、渠道数据量与 `document_no ↔ OMS出库单号` 覆盖。
+2. **渠道切分**：`match_oms.py` / `match_dms.py` 在 `pipeline_common.py` 字段契约下按 `platform_order_no` / `external_order_no` / `DMS销售单号` 互斥切分；剔除 `ORDER_STATUS_EXCLUDE = ['OBSOLETE','CANCEL']`。
+3. **发票类型与冲销治理**：`invoice_type_policy` 按 `config.INVOICE_TYPE_RULES` 决定参与/特殊/待确认；`cancellation_preprocessing.preprocess_cancellations` 按 `CANCELLATION_ORIGINAL_TYPE_MAP` 配对冲销，仅安全的部分冲销按剩余净额进入 AQPP，已冲销业务键被注册以分流订单/发运。
+4. **统一口径与聚合**：`reconciliation_measures.build_three_way_measures` 生成 `SIV/SOV/SIQ/SOQ/GDNQ`；以可参与匹配的发票聚合结果为主表连接发运与订单。
+5. **AQPP 分类**：`aqpp_scenarios.assign_aqpp_scenarios`（内置 `classify_value`、`classify_quantity`）按 `AMOUNT_TOLERANCE=0.02`、`QUANTITY_TOLERANCE=0.02`，容差判断统一经 `tolerance_utils`（带 `FLOAT_BOUNDARY_EPSILON`），得 `AQPP-01~24`；不满足三单齐全或币种/单位准入者归 `NT-00/28–33`；`map_aqpp_to_legacy` 映射 FY25 场景。
+6. **诊断与导出**：`invoice_matchability.build_oms_invoice_type_matchability` 输出 OMS 匹配能力页；`legacy_summary.build_fy25_format_summary` 生成去年版式汇总；`export_utils` + `export_schema` 输出总体/公司/场景汇总、AQPP 明细与「其他未匹配」明细（含冲销明细）。程序仅归类，不自动下错报结论。
+
+## 📋 输入与输出
+
+- **输入**：`config.INPUT_DIR` 下订单/发运 SQL（`订单清单：25.12.01-26.06.30.sql`、`发运单清单：25.12.01-26.06.30.sql`）与发票目录（`发票清单：26.01.01-26.06.30/`），仅读取不修改。
+- **中间数据**：`config.PKL_DIR`（`pkl/2026H1/`）三份标准化 PKL，由 `preprocess_2026.py` 生成、匹配阶段复用。
+- **输出**（`config.OUTPUT_DIR` = `output/2026H1/`，OMS 与 DMS 各多份）：
+  - `…汇总.xlsx`：含 `汇总`、`AQPP场景汇总`、`去年格式汇总`、`发票类型汇总`、`OMS类型匹配能力`、`PBC-AQPP桥接`、`冲销处理汇总` 等 Sheet；
+  - `…明细.xlsx`：按 AQPP 大类拆 `完全匹配`/`金额差异`/`数量差异`/`数量+金额差异`；
+  - `…明细-其他未匹配.xlsx`：`Not Test`、`仅订单`、`仅发货单`、`仅发票`、`已冲销净额0`、`冲销业务待确认`、`特殊发票明细`、`冲销配对明细`；
+  - `原始发票清单按类型拆分/`、`发票清单按匹配范围及类型拆分/`（超 `1,048,575` 行自动分卷并生成清单 CSV）。
+
+## ⚙️ 配置说明
+
+集中在 `config.py`：
+
+- 路径：`ORDER_SQL` / `DELIVERY_SQL` / `INVOICE_DIR`、`OUTPUT_PREFIX`、`TARGET_YEAR`、`*_PKL`；
+- `ORDER_STATUS_EXCLUDE = ['OBSOLETE','CANCEL']`；
+- `INVOICE_TYPE_RULES`：每种发票类型的业务含义、是否参与匹配、是否特殊业务；
+- `PBC_INVOICE_SCOPE_TYPES`：原始 PBC 业务范围拆分（ToB-OMS / ToC / 其他），不控制 AQPP 参与政策；
+- `CANCELLATION_ORIGINAL_TYPE_MAP` / `CANCELLATION_INVOICE_TYPES` / `CANCELLATION_PROCESSING_ENABLED`：冲销配对规则；
+- `AMOUNT_TOLERANCE = 0.02`、`QUANTITY_TOLERANCE = 0.02`、`AMOUNT_TAIL_TOLERANCE = 1.0`、`FLOAT_BOUNDARY_EPSILON = 1e-9`；
+- `BASE_CURRENCY='CNY'`、`ASSUME_BASE_CURRENCY_WHEN_ORDER_MISSING`、`ASSUME_BASIC_QUANTITY_UNIT`、`AQPP_ALLOWED_CURRENCY_STATUSES` / `AQPP_ALLOWED_UNIT_STATUSES`。
+
+所有 AQPP/场景判断引用上述集中容差，主流程禁止散落硬编码阈值或直接浮点相等比较；容差判断一律走 `tolerance_utils`。新增发票类型须同时明确「业务含义 / 是否参与 / 是否特殊业务」，未知类型默认待确认。
+
+## ⚠️ 注意事项
+
+- 数据脱敏：仓库不含真实客户业务数据，示例与说明均为脱敏/合成数据；实际运行需将客户导出文件放入 `input/`。
+- 口径说明：匹配总体、渠道切分、发票类型政策、冲销与容差以 `config.py` 与代码为准，本 README 仅作说明。
+- 三层金额范围：原始发票清单金额 / 参与匹配发票金额 / AQPP 金额三层范围，占比分母各不相同，差异应可由「不参与匹配的发票类型」「关键匹配键缺失」或聚合口径解释，不静默丢弃。
+- 审计结论：程序不自动下错报结论，仅按 AQPP/FY25 规则与冲销前置规则输出差异，应对措施由项目组人工选择。
+
+## 🔗 相关仓库
+
+- https://github.com/Gvmeakiss/sales-three-match-miaoke-2026
+- https://github.com/Gvmeakiss/miaoke-sales-to-b-2025
+- https://github.com/Gvmeakiss/miaoke-sales-to-c
+- https://github.com/Gvmeakiss/sales-three-match-newhope-2026
+
+## 📄 License
+
+MIT（详见仓库 `LICENSE`）。
+
+---
+
+<div align="center">
+
+*Disclaimer: Personal project and personal views. Not affiliated with or endorsed by KPMG or any client.*<br>
+*本仓库为个人项目与个人观点，与任何前/现雇主及客户无关。*
+
+</div>
